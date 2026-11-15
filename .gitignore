@@ -11,6 +11,7 @@ __pycache__/
 
 # Sensitive config with tokens
 config.json
+users_data.json
 
 # Windows driver files
 vb/

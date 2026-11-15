@@ -37,7 +37,7 @@ if not discord.opus.is_loaded():
         pass
 
 # --- КОНФИГУРАЦИЯ ---
-CONFIG_FILE = "config.json"
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 DEFAULT_CONFIG = {
     "tg_token": "",
     "tg_user_id": 0,
@@ -91,7 +91,7 @@ def save_config(cfg):
 config = load_config()
 
 # --- БАЗА ПРОФИЛЕЙ ПОЛЬЗОВАТЕЛЕЙ (РАЗДЕЛЬНЫЙ ДОСТУП TELEGRAM И WEB) ---
-USERS_FILE = "users_data.json"
+USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users_data.json")
 
 
 def load_users_data() -> dict:
@@ -115,15 +115,23 @@ def save_users_data(data: dict):
 users_db = load_users_data()
 
 
-def get_user_profile(source: str, user_id: str, default_name: str = "") -> dict:
-    source_key = "tg" if source == "tg" else "web"
-    uid = str(user_id)
-    table = users_db.setdefault(source_key, {})
+def get_user_profile(source_or_uid: str, user_id: Optional[str] = None, default_name: str = "") -> dict:
+    if user_id is None:
+        raw_uid = str(source_or_uid)
+        source = "tg" if raw_uid.startswith("tg_") else "web"
+        uid = raw_uid[3:] if raw_uid.startswith("tg_") else raw_uid
+    else:
+        source = "tg" if source_or_uid == "tg" else "web"
+        uid = str(user_id)
+        if uid.startswith("tg_"):
+            uid = uid[3:]
+
+    table = users_db.setdefault(source, {})
     if uid not in table:
         table[uid] = {
             "id": uid,
             "name": default_name or (f"TG_{uid}" if source == "tg" else f"Гость_{uid[-4:]}"),
-            "speaker": config.get("default_speaker", "aidar"),
+            "speaker": config.get("speaker", config.get("default_speaker", "aidar")),
             "effect": "none",
             "last_active": time.time()
         }
@@ -137,14 +145,24 @@ def get_user_profile(source: str, user_id: str, default_name: str = "") -> dict:
     return table[uid]
 
 
-def update_user_profile(source: str, user_id: str, speaker: Optional[str] = None, effect: Optional[str] = None, name: Optional[str] = None) -> dict:
-    profile = get_user_profile(source, user_id)
-    if speaker:
-        profile["speaker"] = speaker
-    if effect:
-        profile["effect"] = effect
-    if name:
-        profile["name"] = name.strip()[:32]
+def update_user_profile(source_or_uid: str, user_id_or_updates=None, speaker: Optional[str] = None, effect: Optional[str] = None, name: Optional[str] = None, default_name: str = "") -> dict:
+    if isinstance(user_id_or_updates, dict):
+        profile = get_user_profile(source_or_uid, default_name=default_name or user_id_or_updates.get("name", ""))
+        updates = user_id_or_updates
+        if "speaker" in updates and updates["speaker"]:
+            profile["speaker"] = updates["speaker"]
+        if "effect" in updates and updates["effect"]:
+            profile["effect"] = updates["effect"]
+        if "name" in updates and updates["name"]:
+            profile["name"] = updates["name"].strip()[:32]
+    else:
+        profile = get_user_profile(source_or_uid, user_id_or_updates, default_name=default_name or name or "")
+        if speaker:
+            profile["speaker"] = speaker
+        if effect:
+            profile["effect"] = effect
+        if name:
+            profile["name"] = name.strip()[:32]
     profile["last_active"] = time.time()
     save_users_data(users_db)
     return profile
@@ -212,7 +230,7 @@ tts_queue = queue.Queue()
 status_state = {
     "status": "idle",
     "current_text": "",
-    "speaker": config["speaker"],
+    "speaker": config.get("speaker", config.get("default_speaker", "aidar")),
     "queue_len": 0
 }
 
@@ -651,10 +669,260 @@ def enqueue_tts(text: str, speaker: Optional[str] = None, effect: Optional[str] 
     status_state["queue_len"] = tts_queue.qsize()
 
 
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 # --- TELEGRAM BOT ИНТЕГРАЦИЯ (AIOGRAM 3.X) ---
+try:
+    from aiogram import types
+except ImportError:
+    types = None
+
 tg_bot_task: Optional[asyncio.Task] = None
 tg_bot_instance = None
 tg_dispatcher_instance = None
+
+silero_speakers = [
+    ("aidar", "⚡ Айдар (Мужской)"),
+    ("eugene", "🎙️ Евгений (Баритон)"),
+    ("xenia", "✨ Ксения (Четкий)"),
+    ("baya", "🌸 Байя (Мягкий)"),
+    ("kseniya", "🎭 Ксения 2 (Эмоц.)"),
+    ("random", "🎲 Рандомный")
+]
+
+piper_speakers = [
+    ("dmitri", "⚡ Дмитрий (Piper VITS)"),
+    ("irina", "🌸 Ирина (Piper VITS)")
+]
+
+edge_speakers = [
+    ("edge_dmitry", "🌐 Дмитрий Neural (Edge)")
+]
+
+all_speakers_dict = dict(silero_speakers + piper_speakers + edge_speakers)
+
+available_effects = [
+    ("none", "✨ Обычный"),
+    ("radio", "📻 Рация"),
+    ("chipmunk", "🐿️ Бурундук"),
+    ("demon", "👹 Демон"),
+    ("robot", "🤖 Робот"),
+    ("echo", "📢 Эхо")
+]
+
+
+def get_personal_link(user_id: str, name: str, spk: str, eff: str):
+    import urllib.parse
+    host = (config.get("server_public_url") or "").strip()
+    if not host:
+        host = f"http://{get_local_ip()}:8000"
+    clean_host = host.rstrip("/")
+    safe_name = urllib.parse.quote(name)
+    return f"{clean_host}/?uid=tg_{user_id}&name={safe_name}&spk={spk}&eff={eff}"
+
+
+def get_voice_keyboard(current_speaker: str = "aidar", current_effect: str = "none", user_id: str = "0", name: str = "Пользователь"):
+    rows = []
+    rows.append([types.InlineKeyboardButton(text="— 🗣️ Silero TTS (Эмоции/Ударения) —", callback_data="header_silero")])
+    silero_btns = []
+    for code, sname in silero_speakers:
+        prefix = "✅ " if current_speaker == code else ""
+        silero_btns.append(types.InlineKeyboardButton(text=f"{prefix}{sname}", callback_data=f"voice_{code}"))
+    for i in range(0, len(silero_btns), 2):
+        rows.append(silero_btns[i:i+2])
+
+    rows.append([types.InlineKeyboardButton(text="— 🎤 Piper TTS (Студийные VITS) —", callback_data="header_piper")])
+    piper_btns = []
+    for code, sname in piper_speakers:
+        prefix = "✅ " if current_speaker == code else ""
+        piper_btns.append(types.InlineKeyboardButton(text=f"{prefix}{sname}", callback_data=f"voice_{code}"))
+    rows.append(piper_btns)
+
+    rows.append([types.InlineKeyboardButton(text="— 🌐 Edge TTS (Microsoft Neural) —", callback_data="header_edge")])
+    for code, sname in edge_speakers:
+        prefix = "✅ " if current_speaker == code else ""
+        rows.append([types.InlineKeyboardButton(text=f"{prefix}{sname}", callback_data=f"voice_{code}")])
+
+    eff_name = dict(available_effects).get(current_effect, "✨ Обычный")
+    rows.append([
+        types.InlineKeyboardButton(text=f"🎭 Выбрать эффект (сейчас: {eff_name})", callback_data="open_effects")
+    ])
+    rows.append([
+        types.InlineKeyboardButton(text="🎮 Discord Каналы", callback_data="open_discord"),
+        types.InlineKeyboardButton(text="📊 Статус", callback_data="open_status")
+    ])
+    personal_url = get_personal_link(user_id, name, current_speaker, current_effect)
+    rows.append([
+        types.InlineKeyboardButton(text="🌐 Открыть веб-пульт", url=personal_url)
+    ])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_effect_keyboard(current_effect: str = "none", current_speaker: str = "aidar", user_id: str = "0", name: str = "Пользователь"):
+    rows = []
+    rows.append([types.InlineKeyboardButton(text="— 🎭 Звуковые эффекты / Модуляция —", callback_data="header_effects")])
+    eff_btns = []
+    for code, ename in available_effects:
+        prefix = "✅ " if current_effect == code else ""
+        eff_btns.append(types.InlineKeyboardButton(text=f"{prefix}{ename}", callback_data=f"effect_{code}"))
+    for i in range(0, len(eff_btns), 2):
+        rows.append(eff_btns[i:i+2])
+
+    spk_name = all_speakers_dict.get(current_speaker, current_speaker)
+    rows.append([
+        types.InlineKeyboardButton(text=f"🗣️ Выбрать голос (сейчас: {spk_name})", callback_data="open_voices")
+    ])
+    rows.append([
+        types.InlineKeyboardButton(text="🎮 Discord Каналы", callback_data="open_discord"),
+        types.InlineKeyboardButton(text="📊 Статус", callback_data="open_status")
+    ])
+    personal_url = get_personal_link(user_id, name, current_speaker, current_effect)
+    rows.append([
+        types.InlineKeyboardButton(text="🌐 Открыть веб-пульт", url=personal_url)
+    ])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_discord_keyboard_and_text(user_id: str = "0", name: str = "Пользователь"):
+    token = config.get("discord_token", "").strip()
+    online = discord_bot_instance is not None and discord_bot_instance.is_ready()
+    vc = get_active_voice_client()
+    in_voice = vc is not None and vc.is_connected()
+    bot_name = str(discord_bot_instance.user) if online else "Не в сети"
+    st_icon = "🟢" if (online and in_voice) else ("🟡" if online else "🔴")
+
+    guild_name = vc.channel.guild.name if (in_voice and vc and vc.channel and vc.channel.guild) else ""
+    ch_name = vc.channel.name if (in_voice and vc and vc.channel) else ""
+    ch_str = f"🔊 <b>{ch_name}</b> (сервер <b>{guild_name}</b>)" if in_voice else "<i>Не подключен к каналу</i>"
+
+    text = (
+        f"🎮 <b>Управление Discord Ботом:</b>\n\n"
+        f"• Бот: <b>{bot_name}</b>\n"
+        f"• Статус: {st_icon} <b>{'В голосовом канале' if in_voice else ('В сети' if online else 'Офлайн')}</b>\n"
+        f"• Голосовой канал: {ch_str}\n\n"
+    )
+
+    rows = []
+    if online:
+        channels_buttons = []
+        for g in discord_bot_instance.guilds:
+            for ch in g.voice_channels:
+                is_current = in_voice and vc and vc.channel and vc.channel.id == ch.id
+                prefix = "✅ " if is_current else "📞 "
+                label = f"{prefix}{ch.name[:16]}"
+                channels_buttons.append(types.InlineKeyboardButton(text=label, callback_data=f"djoin_{ch.id}"))
+        
+        for i in range(0, len(channels_buttons), 2):
+            rows.append(channels_buttons[i:i+2])
+
+        if in_voice:
+            rows.append([types.InlineKeyboardButton(text="🚪 Отключить бота от канала", callback_data="dleave")])
+        
+        text += "💡 <i>Нажмите на голосовой канал ниже, чтобы бот зашел в него:</i>"
+    else:
+        if not token:
+            text += "❌ <b>Токен Discord-бота не указан!</b>\nУкажите токен в настройках веб-панели (иконка 🎮 в шапке сайта)."
+        else:
+            text += "⏳ <b>Discord-бот подключается к сети...</b>\nПожалуйста, подождите несколько секунд и обновите статус кнопкой ниже."
+
+    rows.append([
+        types.InlineKeyboardButton(text="🔄 Обновить статус Discord", callback_data="drefresh")
+    ])
+    rows.append([
+        types.InlineKeyboardButton(text="🗣️ Выбрать голос", callback_data="open_voices"),
+        types.InlineKeyboardButton(text="📊 Статус системы", callback_data="open_status")
+    ])
+    profile = get_user_profile("tg", user_id, default_name=name)
+    personal_url = get_personal_link(user_id, name, profile.get("speaker", "aidar"), profile.get("effect", "none"))
+    rows.append([
+        types.InlineKeyboardButton(text="🌐 Открыть веб-пульт", url=personal_url)
+    ])
+
+    kb = types.InlineKeyboardMarkup(inline_keyboard=rows)
+    return text, kb
+
+
+def build_status_keyboard_and_text(user_id: str, name: str):
+    profile = get_user_profile("tg", user_id, default_name=name)
+    st = status_state["status"]
+    q = tts_queue.qsize()
+    eff_name = dict(available_effects).get(profile.get("effect", "none"), "✨ Обычный")
+    spk_name = all_speakers_dict.get(profile.get("speaker", "aidar"), "aidar")
+    tts_vol = int(config.get("volume", 1.0) * 100)
+    sfx_vol = int(config.get("sfx_volume", 0.5) * 100)
+    vc = get_active_voice_client()
+    vc_status = f"🟢 В канале ({vc.channel.name})" if (vc and vc.is_connected() and vc.channel) else "⚪ Не в канале"
+    
+    text = (
+        f"📊 <b>Статус системы:</b>\n"
+        f"• Состояние озвучки: <code>{st}</code>\n"
+        f"• Discord: <b>{vc_status}</b>\n"
+        f"• В очереди: <b>{q}</b> фраз\n\n"
+        f"👤 <b>Ваш профиль ({profile.get('name', name)}):</b>\n"
+        f"• Голос: <b>{spk_name}</b>\n"
+        f"• Эффект: <b>{eff_name}</b>\n"
+        f"• Громкость речи: <b>{tts_vol}%</b>\n"
+        f"• Громкость SFX: <b>{sfx_vol}%</b>"
+    )
+
+    personal_url = get_personal_link(user_id, name, profile.get("speaker", "aidar"), profile.get("effect", "none"))
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🔄 Обновить статус", callback_data="refresh_status")],
+        [types.InlineKeyboardButton(text="🗣️ Сменить голос", callback_data="open_voices"),
+         types.InlineKeyboardButton(text="🎭 Сменить эффект", callback_data="open_effects")],
+        [types.InlineKeyboardButton(text="🎮 Discord Каналы", callback_data="open_discord"),
+         types.InlineKeyboardButton(text="📖 Шпаргалка", callback_data="open_help")],
+        [types.InlineKeyboardButton(text="🌐 Открыть персональный веб-пульт", url=personal_url)]
+    ])
+    return text, kb
+
+
+def build_help_keyboard_and_text(user_id: str, name: str):
+    profile = get_user_profile("tg", user_id, default_name=name)
+    text = (
+        f"📖 <b>Шпаргалка: Silero vs Piper vs Edge TTS:</b>\n\n"
+        f"🗣️ <b>1. Silero TTS (Айдар, Евгений, Ксения, Байя):</b>\n"
+        f"  • Максимальная эмоциональность и отыгрыш\n"
+        f"  • <b>Знак <code>+</code> перед гласной</b> — принудительное ударение:\n"
+        f"    <code>Впереди старинный з+амок</code> (крепость)\n"
+        f"    <code>На двери висит зам+ок</code> (дверной)\n"
+        f"  • <b><code>...</code> (многоточие)</b> — пауза раздумья (~0.5 сек)\n"
+        f"  • <b><code>—</code> (тире)</b> — перепад тона и смысловой акцент\n"
+        f"  • <b><code>?!</code></b> — вопросительный и восклицательный подъем\n\n"
+        f"🎤 <b>2. Piper TTS (Дмитрий, Ирина):</b>\n"
+        f"  • Чистый оффлайн-голос диктора без артефактов\n"
+        f"  • Автоматически читает любые числа, даты, дроби\n"
+        f"  • Знак <code>+</code> ставить не нужно (работает на фонемах)\n\n"
+        f"🌐 <b>3. Edge TTS (Дмитрий Neural от Microsoft):</b>\n"
+        f"  • Естественный мужской нейро-голос ru-RU-DmitryNeural\n"
+        f"  • Работает через облако Microsoft Edge (без задержек и без лимитов)\n"
+        f"  • Идеально читает длинные предложения и сложные тексты\n\n"
+        f"🎵 <b>4. Проигрывание аудиофайлов и музыки:</b>\n"
+        f"  • Перешлите в этот бот любой аудиофайл (.mp3, .wav, .ogg, .flac) или голосовое сообщение — оно мгновенно прозвучит в Discord с громкостью SFX!\n\n"
+        f"⚡ <b>5. Быстрые теги в сообщении:</b>\n"
+        f"  • <code>[radio] Прием, как слышно?</code>\n"
+        f"  • <code>[demon] Я уничтожу вас!</code>\n"
+        f"  • <code>[edge_dmitry] Естественный диктор от Microsoft</code>\n"
+        f"  • <code>[eugene:radio] Внимание отряду!</code>"
+    )
+    personal_url = get_personal_link(user_id, name, profile.get("speaker", "aidar"), profile.get("effect", "none"))
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🗣️ Выбрать голос", callback_data="open_voices"),
+         types.InlineKeyboardButton(text="🎭 Выбрать эффект", callback_data="open_effects")],
+        [types.InlineKeyboardButton(text="🎮 Discord Каналы", callback_data="open_discord"),
+         types.InlineKeyboardButton(text="📊 Статус", callback_data="open_status")],
+        [types.InlineKeyboardButton(text="🌐 Открыть персональный веб-пульт", url=personal_url)]
+    ])
+    return text, kb
 
 
 async def start_telegram_bot_service():
@@ -674,71 +942,6 @@ async def start_telegram_bot_service():
         tg_bot_instance = bot
         tg_dispatcher_instance = dp
 
-        silero_speakers = [
-            ("aidar", "⚡ Айдар (Мужской)"),
-            ("eugene", "🎙️ Евгений (Баритон)"),
-            ("xenia", "✨ Ксения (Четкий)"),
-            ("baya", "🌸 Байя (Мягкий)"),
-            ("kseniya", "🎭 Ксения 2 (Эмоц.)"),
-            ("random", "🎲 Рандомный")
-        ]
-
-        piper_speakers = [
-            ("dmitri", "⚡ Дмитрий (Piper VITS)"),
-            ("irina", "🌸 Ирина (Piper VITS)")
-        ]
-
-        edge_speakers = [
-            ("edge_dmitry", "🌐 Дмитрий Neural (Edge)")
-        ]
-
-        all_speakers_dict = dict(silero_speakers + piper_speakers + edge_speakers)
-
-        available_effects = [
-            ("none", "✨ Обычный"),
-            ("radio", "📻 Рация"),
-            ("chipmunk", "🐿️ Бурундук"),
-            ("demon", "👹 Демон"),
-            ("robot", "🤖 Робот"),
-            ("echo", "📢 Эхо")
-        ]
-
-        def get_voice_keyboard(current_speaker: str = "aidar", current_effect: str = "none"):
-            builder = InlineKeyboardBuilder()
-            # Silero секция
-            builder.row(types.InlineKeyboardButton(text="— 🗣️ Silero TTS (Эмоции/Ударения) —", callback_data="header_silero"))
-            for code, name in silero_speakers:
-                prefix = "✅ " if current_speaker == code else ""
-                builder.button(text=f"{prefix}{name}", callback_data=f"voice_{code}")
-            builder.adjust(1, 2, 2, 2)
-
-            # Piper секция
-            builder.row(types.InlineKeyboardButton(text="— 🎤 Piper TTS (Студийные VITS) —", callback_data="header_piper"))
-            for code, name in piper_speakers:
-                prefix = "✅ " if current_speaker == code else ""
-                builder.button(text=f"{prefix}{name}", callback_data=f"voice_{code}")
-
-            # Edge TTS секция
-            builder.row(types.InlineKeyboardButton(text="— 🌐 Edge TTS (Microsoft Neural) —", callback_data="header_edge"))
-            for code, name in edge_speakers:
-                prefix = "✅ " if current_speaker == code else ""
-                builder.button(text=f"{prefix}{name}", callback_data=f"voice_{code}")
-
-            eff_name = dict(available_effects).get(current_effect, "✨ Обычный")
-            builder.row(
-                types.InlineKeyboardButton(text=f"🎭 Эффект: {eff_name}", callback_data="open_effects")
-            )
-            return builder.as_markup()
-
-        def get_effect_keyboard(current_effect: str = "none"):
-            builder = InlineKeyboardBuilder()
-            for code, name in available_effects:
-                prefix = "✅ " if current_effect == code else ""
-                builder.button(text=f"{prefix}{name}", callback_data=f"effect_{code}")
-            builder.adjust(2)
-            builder.row(types.InlineKeyboardButton(text="⬅️ Назад к голосам", callback_data="open_voices"))
-            return builder.as_markup()
-
         @dp.message(Command("start"))
         async def cmd_start(msg: types.Message):
             user_id = str(msg.from_user.id)
@@ -747,14 +950,7 @@ async def start_telegram_bot_service():
 
             spk_name = all_speakers_dict.get(profile.get("speaker", "aidar"), "aidar")
             eff_name = dict(available_effects).get(profile.get("effect", "none"), "✨ Обычный")
-
-            import urllib.parse
-            host = (config.get("server_public_url") or "").strip()
-            if not host:
-                host = f"http://{get_local_ip()}:8000"
-            clean_host = host.rstrip("/")
-            safe_name = urllib.parse.quote(name)
-            personal_link = f"{clean_host}/?uid=tg_{user_id}&name={safe_name}&spk={profile.get('speaker', 'aidar')}&eff={profile.get('effect', 'none')}"
+            personal_link = get_personal_link(user_id, name, profile.get("speaker", "aidar"), profile.get("effect", "none"))
 
             text = (
                 f"🎙️ <b>TTS Discord Bridge</b>\n\n"
@@ -767,136 +963,231 @@ async def start_telegram_bot_service():
                 f"• Аудиофайл или голосовое ➡️ играет в канале Discord\n"
                 f"• /voice — сменить свой персональный голос\n"
                 f"• /effect — сменить свой звуковой эффект\n"
-                f"• /help — шпаргалка по эмоциям и ударениям (+)\n"
-                f"• /discord — статус подключения к голосовому каналу"
+                f"• /discord — подключить бота к каналу Discord\n"
+                f"• /status — статус очереди и Discord-бота\n"
+                f"• /help — шпаргалка по эмоциям и ударениям (+)"
             )
             kb = types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text="🌐 Открыть персональный веб-пульт", url=personal_link)],
                 [types.InlineKeyboardButton(text="🗣️ Выбрать голос", callback_data="open_voices"),
-                 types.InlineKeyboardButton(text="🎭 Выбрать эффект", callback_data="open_effects")]
+                 types.InlineKeyboardButton(text="🎭 Выбрать эффект", callback_data="open_effects")],
+                [types.InlineKeyboardButton(text="🎮 Discord Каналы", callback_data="open_discord"),
+                 types.InlineKeyboardButton(text="📊 Статус", callback_data="open_status")],
+                [types.InlineKeyboardButton(text="📖 Шпаргалка по ударениям (+)", callback_data="open_help")]
             ])
             await msg.answer(text, parse_mode="HTML", reply_markup=kb)
 
         @dp.message(Command("help"))
         async def cmd_help(msg: types.Message):
-            text = (
-                f"📖 <b>Шпаргалка: Silero vs Piper vs Edge TTS:</b>\n\n"
-                f"🗣️ <b>1. Silero TTS (Айдар, Евгений, Ксения, Байя):</b>\n"
-                f"  • Максимальная эмоциональность и отыгрыш\n"
-                f"  • <b>Знак <code>+</code> перед гласной</b> — принудительное ударение:\n"
-                f"    <code>Впереди старинный з+амок</code> (крепость)\n"
-                f"    <code>На двери висит зам+ок</code> (дверной)\n"
-                f"  • <b><code>...</code> (многоточие)</b> — пауза раздумья (~0.5 сек)\n"
-                f"  • <b><code>—</code> (тире)</b> — перепад тона и смысловой акцент\n"
-                f"  • <b><code>?!</code></b> — вопросительный и восклицательный подъем\n\n"
-                f"🎤 <b>2. Piper TTS (Дмитрий, Ирина):</b>\n"
-                f"  • Чистый оффлайн-голос диктора без артефактов\n"
-                f"  • Автоматически читает любые числа, даты, дроби\n"
-                f"  • Знак <code>+</code> ставить не нужно (работает на фонемах)\n\n"
-                f"🌐 <b>3. Edge TTS (Дмитрий Neural от Microsoft):</b>\n"
-                f"  • Естественный мужской нейро-голос ru-RU-DmitryNeural\n"
-                f"  • Работает через облако Microsoft Edge (без задержек и без лимитов)\n"
-                f"  • Идеально читает длинные предложения и сложные тексты\n\n"
-                f"🎵 <b>4. Проигрывание аудиофайлов и музыки:</b>\n"
-                f"  • Перешлите в этот бот любой аудиофайл (mp3, wav, ogg, flac) или голосовое сообщение — оно мгновенно прозвучит в Discord с громкостью SFX!\n\n"
-                f"⚡ <b>5. Быстрые теги в сообщении:</b>\n"
-                f"  • <code>[radio] Прием, как слышно?</code>\n"
-                f"  • <code>[demon] Я уничтожу вас!</code>\n"
-                f"  • <code>[edge_dmitry] Естественный диктор от Microsoft</code>\n"
-                f"  • <code>[eugene:radio] Внимание отряду!</code>"
-            )
-            await msg.answer(text, parse_mode="HTML")
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            text, kb = build_help_keyboard_and_text(user_id, name)
+            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+        @dp.message(Command("voice"))
+        async def cmd_voice(msg: types.Message):
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            profile = get_user_profile("tg", user_id, default_name=name)
+            kb = get_voice_keyboard(current_speaker=profile.get("speaker", "aidar"), current_effect=profile.get("effect", "none"), user_id=user_id, name=name)
+            await msg.answer("🗣️ <b>Выберите ваш персональный голос для Discord:</b>", parse_mode="HTML", reply_markup=kb)
+
+        @dp.message(Command("effect"), Command("fx"))
+        async def cmd_effect(msg: types.Message):
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            profile = get_user_profile("tg", user_id, default_name=name)
+            kb = get_effect_keyboard(current_effect=profile.get("effect", "none"), current_speaker=profile.get("speaker", "aidar"), user_id=user_id, name=name)
+            await msg.answer("🎭 <b>Выберите ваш персональный звуковой эффект:</b>", parse_mode="HTML", reply_markup=kb)
+
+        @dp.message(Command("status"))
+        async def cmd_status(msg: types.Message):
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            text, kb = build_status_keyboard_and_text(user_id, name)
+            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+        @dp.message(Command("discord"))
+        async def cmd_discord(msg: types.Message):
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            text, kb = build_discord_keyboard_and_text(user_id, name)
+            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+        @dp.message(Command("dleave"))
+        async def cmd_dleave(msg: types.Message):
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            vc = get_active_voice_client()
+            if vc and vc.is_connected():
+                try:
+                    await vc.disconnect()
+                except Exception:
+                    pass
+                config["discord_voice_channel_id"] = None
+                save_config(config)
+                kb = types.InlineKeyboardMarkup(inline_keyboard=[
+                    [types.InlineKeyboardButton(text="🎮 Войти в канал Discord", callback_data="open_discord")],
+                    [types.InlineKeyboardButton(text="📊 Статус системы", callback_data="open_status")]
+                ])
+                await msg.answer("👋 Discord-бот отключен от голосового канала.", reply_markup=kb)
+            else:
+                kb = types.InlineKeyboardMarkup(inline_keyboard=[
+                    [types.InlineKeyboardButton(text="🎮 Выбрать канал Discord", callback_data="open_discord")]
+                ])
+                await msg.answer("Бот не находится в голосовом канале.", reply_markup=kb)
+
+        # --- CALLBACK QUERY ХЭНДЛЕРЫ ---
 
         @dp.callback_query(F.data.startswith("header_"))
         async def on_header_clicked(callback: types.CallbackQuery):
             await callback.answer()
 
-        @dp.message(Command("voice"))
-        async def cmd_voice(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            profile = get_user_profile("tg", user_id, default_name=msg.from_user.full_name)
-            await msg.answer(
-                "🗣️ <b>Выберите ваш персональный голос для Discord:</b>",
-                parse_mode="HTML",
-                reply_markup=get_voice_keyboard(current_speaker=profile.get("speaker", "aidar"), current_effect=profile.get("effect", "none"))
-            )
-
         @dp.callback_query(F.data == "open_voices")
         async def on_open_voices(callback: types.CallbackQuery):
             user_id = str(callback.from_user.id)
-            profile = get_user_profile("tg", user_id)
-            await callback.message.edit_text(
-                "🗣️ <b>Выберите ваш персональный голос для Discord:</b>",
-                parse_mode="HTML",
-                reply_markup=get_voice_keyboard(current_speaker=profile.get("speaker", "aidar"), current_effect=profile.get("effect", "none"))
-            )
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
+            profile = get_user_profile("tg", user_id, default_name=name)
+            kb = get_voice_keyboard(current_speaker=profile.get("speaker", "aidar"), current_effect=profile.get("effect", "none"), user_id=user_id, name=name)
+            try:
+                await callback.message.edit_text("🗣️ <b>Выберите ваш персональный голос для Discord:</b>", parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+            await callback.answer()
 
         @dp.callback_query(F.data.startswith("voice_"))
         async def on_voice_selected(callback: types.CallbackQuery):
             selected = callback.data.split("_")[1]
             user_id = str(callback.from_user.id)
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
             profile = update_user_profile("tg", user_id, speaker=selected)
             spk_name = all_speakers_dict.get(selected, selected)
-            await callback.message.edit_reply_markup(
-                reply_markup=get_voice_keyboard(current_speaker=selected, current_effect=profile.get("effect", "none"))
-            )
+            kb = get_voice_keyboard(current_speaker=selected, current_effect=profile.get("effect", "none"), user_id=user_id, name=name)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
             await callback.answer(f"Выбран ваш голос: {spk_name}")
-
-        @dp.message(Command("effect"), Command("fx"))
-        async def cmd_effect(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            profile = get_user_profile("tg", user_id, default_name=msg.from_user.full_name)
-            await msg.answer(
-                "🎭 <b>Выберите ваш персональный звуковой эффект:</b>",
-                parse_mode="HTML",
-                reply_markup=get_effect_keyboard(current_effect=profile.get("effect", "none"))
-            )
 
         @dp.callback_query(F.data == "open_effects")
         async def on_open_effects(callback: types.CallbackQuery):
             user_id = str(callback.from_user.id)
-            profile = get_user_profile("tg", user_id)
-            await callback.message.edit_text(
-                "🎭 <b>Выберите ваш персональный звуковой эффект:</b>",
-                parse_mode="HTML",
-                reply_markup=get_effect_keyboard(current_effect=profile.get("effect", "none"))
-            )
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
+            profile = get_user_profile("tg", user_id, default_name=name)
+            kb = get_effect_keyboard(current_effect=profile.get("effect", "none"), current_speaker=profile.get("speaker", "aidar"), user_id=user_id, name=name)
+            try:
+                await callback.message.edit_text("🎭 <b>Выберите ваш персональный звуковой эффект:</b>", parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+            await callback.answer()
 
         @dp.callback_query(F.data.startswith("effect_"))
         async def on_effect_selected(callback: types.CallbackQuery):
             selected = callback.data.split("_")[1]
             user_id = str(callback.from_user.id)
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
             profile = update_user_profile("tg", user_id, effect=selected)
             eff_name = dict(available_effects).get(selected, selected)
-            await callback.message.edit_reply_markup(
-                reply_markup=get_effect_keyboard(current_effect=selected)
-            )
+            kb = get_effect_keyboard(current_effect=selected, current_speaker=profile.get("speaker", "aidar"), user_id=user_id, name=name)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
             await callback.answer(f"Выбран эффект: {eff_name}")
 
-        @dp.message(Command("status"))
-        async def cmd_status(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            profile = get_user_profile("tg", user_id, default_name=msg.from_user.full_name)
-            st = status_state["status"]
-            q = tts_queue.qsize()
-            eff_name = dict(available_effects).get(profile.get("effect", "none"), "✨ Обычный")
-            spk_name = all_speakers_dict.get(profile.get("speaker", "aidar"), "aidar")
-            tts_vol = int(config.get("volume", 1.0) * 100)
-            sfx_vol = int(config.get("sfx_volume", 0.5) * 100)
+        @dp.callback_query(F.data.in_(["open_status", "refresh_status"]))
+        async def on_status_callback(callback: types.CallbackQuery):
+            user_id = str(callback.from_user.id)
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
+            text, kb = build_status_keyboard_and_text(user_id, name)
+            try:
+                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+            await callback.answer("Статус обновлен")
+
+        @dp.callback_query(F.data == "open_help")
+        async def on_help_callback(callback: types.CallbackQuery):
+            user_id = str(callback.from_user.id)
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
+            text, kb = build_help_keyboard_and_text(user_id, name)
+            try:
+                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+            await callback.answer()
+
+        @dp.callback_query(F.data.in_(["open_discord", "drefresh"]))
+        async def on_discord_callback(callback: types.CallbackQuery):
+            user_id = str(callback.from_user.id)
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
+            text, kb = build_discord_keyboard_and_text(user_id, name)
+            try:
+                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+            await callback.answer("Статус Discord обновлен")
+
+        @dp.callback_query(F.data.startswith("djoin_"))
+        async def on_djoin_callback(callback: types.CallbackQuery):
+            channel_id = int(callback.data.split("_")[1])
+            user_id = str(callback.from_user.id)
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
+            if not discord_bot_instance or not discord_bot_instance.is_ready():
+                await callback.answer("Discord-бот не в сети или не авторизован", show_alert=True)
+                return
+            ch = discord_bot_instance.get_channel(channel_id)
+            if not ch:
+                try:
+                    ch = await discord_bot_instance.fetch_channel(channel_id)
+                except Exception:
+                    ch = None
+            if not ch or not isinstance(ch, discord.VoiceChannel):
+                await callback.answer("Голосовой канал не найден или недоступен", show_alert=True)
+                return
+            global active_discord_voice_client
+            try:
+                if ch.guild.voice_client:
+                    vc = ch.guild.voice_client
+                    if vc.channel.id != ch.id:
+                        await vc.move_to(ch)
+                    active_discord_voice_client = vc
+                else:
+                    active_discord_voice_client = await ch.connect(self_deaf=False, self_mute=False)
+                config["discord_voice_channel_id"] = ch.id
+                save_config(config)
+                await callback.answer(f"✅ Подключен к {ch.name}!")
+                text, kb = build_discord_keyboard_and_text(user_id, name)
+                try:
+                    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error(f"[Telegram] Ошибка подключения к голосовому каналу: {e}")
+                await callback.answer(f"Ошибка подключения: {e}", show_alert=True)
+
+        @dp.callback_query(F.data == "dleave")
+        async def on_dleave_callback(callback: types.CallbackQuery):
+            user_id = str(callback.from_user.id)
+            name = callback.from_user.full_name or callback.from_user.username or f"User_{user_id}"
+            global active_discord_voice_client
             vc = get_active_voice_client()
-            vc_status = f"🟢 Подключен ({vc.channel.name})" if vc and vc.is_connected() else "⚪ Офлайн"
-            await msg.answer(
-                f"📊 <b>Статус системы:</b>\n"
-                f"• Состояние озвучки: <code>{st}</code>\n"
-                f"• Discord канал: <b>{vc_status}</b>\n"
-                f"• В очереди: <b>{q}</b> фраз\n\n"
-                f"👤 <b>Ваш профиль ({profile.get('name')}):</b>\n"
-                f"• Голос: <b>{spk_name}</b>\n"
-                f"• Эффект: <b>{eff_name}</b>\n"
-                f"• Громкость речи: <b>{tts_vol}%</b>\n"
-                f"• Громкость SFX: <b>{sfx_vol}%</b>",
-                parse_mode="HTML"
-            )
+            if vc:
+                try:
+                    await vc.disconnect()
+                except Exception:
+                    pass
+                active_discord_voice_client = None
+            config["discord_voice_channel_id"] = None
+            save_config(config)
+            await callback.answer("Отключен от канала")
+            text, kb = build_discord_keyboard_and_text(user_id, name)
+            try:
+                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+
+        # --- СООБЩЕНИЯ И АУДИОФАЙЛЫ ---
 
         @dp.message(F.audio | F.voice | F.document)
         async def on_audio_message(msg: types.Message):
@@ -938,7 +1229,7 @@ async def start_telegram_bot_service():
                 logger.error(f"[Telegram] Ошибка воспроизведения файла: {e}")
                 await msg.reply(f"❌ Ошибка воспроизведения: {e}")
 
-        @dp.message(F.text)
+        @dp.message(F.text & ~F.text.startswith("/"))
         async def on_text_message(msg: types.Message):
             user_id = str(msg.from_user.id)
             name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
@@ -969,98 +1260,6 @@ async def start_telegram_bot_service():
                 await msg.react([types.ReactionTypeEmoji(emoji="📢")])
             except Exception:
                 pass
-
-        @dp.message(Command("discord"))
-        async def cmd_discord(msg: types.Message):
-            user_id = msg.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                return
-
-            token = config.get("discord_token", "").strip()
-            if not token:
-                await msg.answer("❌ <b>Discord-бот не настроен.</b>\nУкажите Discord Bot Token в веб-пульте на ПК (иконка 🤖 в шапке).", parse_mode="HTML")
-                return
-
-            online = discord_bot_instance is not None and discord_bot_instance.is_ready()
-            vc = get_active_voice_client()
-            in_voice = vc is not None and vc.is_connected()
-            bot_name = str(discord_bot_instance.user) if online else "Не в сети"
-            st_icon = "🟢" if online else "🟡"
-            ch_str = f"🔊 <b>{vc.channel.name}</b> (сервер {vc.channel.guild.name})" if in_voice else "<i>Не подключен к каналу</i>"
-
-            builder = InlineKeyboardBuilder()
-            if online:
-                for guild in discord_bot_instance.guilds:
-                    for ch in guild.voice_channels[:6]:
-                        builder.button(text=f"📞 {ch.name[:16]}", callback_data=f"djoin_{ch.id}")
-                if in_voice:
-                    builder.button(text="🚪 Выйти из канала", callback_data="dleave")
-                builder.adjust(2)
-
-            text = (
-                f"🤖 <b>Discord Voicer Bot:</b>\n\n"
-                f"• Имя: <b>{bot_name}</b>\n"
-                f"• Статус: {st_icon} {'В сети' if online else 'Подключение...'}\n"
-                f"• Голосовой канал: {ch_str}\n\n"
-                f"💡 <i>Нажмите кнопку ниже, чтобы бот зашел в голосовой канал на сервере:</i>"
-            )
-            await msg.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-
-        @dp.callback_query(F.data.startswith("djoin_"))
-        async def on_djoin_callback(callback: types.CallbackQuery):
-            channel_id = int(callback.data.split("_")[1])
-            if not discord_bot_instance or not discord_bot_instance.is_ready():
-                await callback.answer("Бот не в сети", show_alert=True)
-                return
-            ch = discord_bot_instance.get_channel(channel_id)
-            if not ch:
-                try:
-                    ch = await discord_bot_instance.fetch_channel(channel_id)
-                except Exception:
-                    ch = None
-            if not ch or not isinstance(ch, discord.VoiceChannel):
-                await callback.answer("Канал не найден", show_alert=True)
-                return
-            global active_discord_voice_client
-            try:
-                if ch.guild.voice_client:
-                    vc = await ch.guild.voice_client.move_to(ch)
-                else:
-                    vc = await ch.connect(self_deaf=False, self_mute=False)
-                active_discord_voice_client = vc
-                config["discord_voice_channel_id"] = ch.id
-                save_config(config)
-                await callback.answer(f"Подключен к {ch.name}!")
-                await callback.message.edit_text(
-                    f"✅ Discord-бот успешно подключен к каналу: <b>{ch.name}</b> ({ch.guild.name})",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                await callback.answer(f"Ошибка: {e}", show_alert=True)
-
-        @dp.callback_query(F.data == "dleave")
-        async def on_dleave_callback(callback: types.CallbackQuery):
-            vc = get_active_voice_client()
-            if vc and vc.is_connected():
-                await vc.disconnect()
-                config["discord_voice_channel_id"] = None
-                save_config(config)
-                await callback.answer("Отключен от канала")
-                await callback.message.edit_text("👋 Discord-бот отключен от голосового канала.")
-            else:
-                await callback.answer("Не в канале")
-
-        @dp.message(Command("dleave"))
-        async def cmd_dleave(msg: types.Message):
-            vc = get_active_voice_client()
-            if vc and vc.is_connected():
-                await vc.disconnect()
-                config["discord_voice_channel_id"] = None
-                save_config(config)
-                await msg.answer("👋 Discord-бот отключен от голосового канала.")
-            else:
-                await msg.answer("Бот не находится в голосовом канале.")
 
         logger.info("[Telegram] Бот успешно авторизован и запущен!")
         await dp.start_polling(bot, handle_signals=False)
@@ -1266,17 +1465,6 @@ class DiscordTokenRequest(BaseModel):
 
 class DiscordJoinRequest(BaseModel):
     channel_id: Union[int, str]
-
-
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
 
 
 # --- HTML / JS / CSS ИНТЕРФЕЙС В СТИЛЕ DISCORD DARK THEME ---
