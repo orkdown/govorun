@@ -1,0 +1,27 @@
+{
+    "tg_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+    "tg_user_id": 0,
+    "discord_token": "YOUR_DISCORD_BOT_TOKEN_HERE",
+    "discord_voice_channel_id": null,
+    "discord_auto_connect": true,
+    "output_cable_enabled": true,
+    "output_discord_enabled": true,
+    "speaker": "aidar",
+    "effect": "none",
+    "cable_device_id": null,
+    "monitor_device_id": null,
+    "monitor_enabled": false,
+    "volume": 1.0,
+    "sfx_volume": 0.5,
+    "quick_phrases": [
+        "👍 Да, согласен",
+        "👎 Неа, не выйдет",
+        "🤫 Парни, я без микрофона, пишу с пульта",
+        "☕ Отойду на 5 минут, скоро буду",
+        "😂 Ахаха, хорош!",
+        "👀 Секунду, сейчас посмотрю",
+        "👋 Всем привет!",
+        "🎮 Го в катку!",
+        "🏆 Красиво сыграно, GG!"
+    ]
+}

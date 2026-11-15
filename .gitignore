@@ -1,0 +1,25 @@
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Sensitive config with tokens
+config.json
+
+# Windows driver files
+vb/
+
+# Audio temp files
+*.wav
+*.mp3
+*.ogg
+
+# OS generated
+.DS_Store
+Thumbs.db

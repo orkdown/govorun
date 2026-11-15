@@ -1,0 +1,17 @@
+torch
+sounddevice
+numpy
+scipy
+soundfile
+piper-tts
+fastapi
+uvicorn[standard]
+aiogram>=3.0.0
+pydantic
+omegaconf>=2.0.0
+pyyaml>=5.1
+num2words
+python-multipart
+edge-tts
+discord.py[voice]
+davey
