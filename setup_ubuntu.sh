@@ -3,7 +3,7 @@ set -e
 
 echo "=== [1/5] Обновление пакетов и установка системных зависимостей Ubuntu ==="
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv ffmpeg git libopus0
+sudo apt install -y python3 python3-pip python3-venv ffmpeg git libopus0 libportaudio2 curl
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR"
