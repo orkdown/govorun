@@ -1,5 +1,4 @@
 torch
-sounddevice
 numpy
 scipy
 soundfile

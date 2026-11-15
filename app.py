@@ -22,10 +22,9 @@ if sys.platform == "win32":
 
 import numpy as np
 import scipy.signal as signal
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import sounddevice as sd
 import torch
 import uvicorn
 import discord
@@ -42,16 +41,12 @@ CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
     "tg_token": "",
     "tg_user_id": 0,
+    "server_public_url": "",
     "discord_token": "",
     "discord_voice_channel_id": None,
     "discord_auto_connect": True,
-    "output_cable_enabled": True,
     "output_discord_enabled": True,
-    "speaker": "aidar",
-    "effect": "none",
-    "cable_device_id": None,
-    "monitor_device_id": None,
-    "monitor_enabled": True,
+    "default_speaker": "aidar",
     "volume": 1.0,
     "sfx_volume": 0.5,
     "quick_phrases": [
@@ -95,43 +90,81 @@ def save_config(cfg):
 
 config = load_config()
 
+# --- БАЗА ПРОФИЛЕЙ ПОЛЬЗОВАТЕЛЕЙ (РАЗДЕЛЬНЫЙ ДОСТУП TELEGRAM И WEB) ---
+USERS_FILE = "users_data.json"
 
-# --- АВТОПОИСК АУДИОУСТРОЙСТВ ---
-def find_cable_device():
+
+def load_users_data() -> dict:
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Ошибка чтения {USERS_FILE}: {e}")
+    return {"tg": {}, "web": {}}
+
+
+def save_users_data(data: dict):
     try:
-        devices = sd.query_devices()
-        for idx, dev in enumerate(devices):
-            if "CABLE Input" in dev["name"] and dev["max_output_channels"] > 0:
-                return idx
-        default_out = sd.default.device[1]
-        return default_out if default_out is not None and default_out >= 0 else 0
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
     except Exception as e:
-        logger.info(f"Локальные звуковые устройства не обнаружены (headless/серверный режим): {e}")
-        return None
+        logger.error(f"Не удалось сохранить {USERS_FILE}: {e}")
 
 
-def find_default_monitor_device():
-    try:
-        devices = sd.query_devices()
-        for idx, dev in enumerate(devices):
-            name_lower = dev["name"].lower()
-            if ("headphone" in name_lower or "наушник" in name_lower or "speaker" in name_lower or "динамик" in name_lower) and dev["max_output_channels"] > 0:
-                if "cable" not in name_lower:
-                    return idx
-        default_out = sd.default.device[1]
-        return default_out if default_out is not None and default_out >= 0 else 0
-    except Exception as e:
-        logger.info(f"Устройства мониторинга не обнаружены (headless/серверный режим): {e}")
-        return None
+users_db = load_users_data()
 
 
-if config["cable_device_id"] is None:
-    config["cable_device_id"] = find_cable_device()
-    save_config(config)
+def get_user_profile(source: str, user_id: str, default_name: str = "") -> dict:
+    source_key = "tg" if source == "tg" else "web"
+    uid = str(user_id)
+    table = users_db.setdefault(source_key, {})
+    if uid not in table:
+        table[uid] = {
+            "id": uid,
+            "name": default_name or (f"TG_{uid}" if source == "tg" else f"Гость_{uid[-4:]}"),
+            "speaker": config.get("default_speaker", "aidar"),
+            "effect": "none",
+            "last_active": time.time()
+        }
+        save_users_data(users_db)
+    else:
+        profile = table[uid]
+        if default_name and profile.get("name") != default_name:
+            profile["name"] = default_name
+            save_users_data(users_db)
+        profile["last_active"] = time.time()
+    return table[uid]
 
-if config["monitor_device_id"] is None:
-    config["monitor_device_id"] = find_default_monitor_device()
-    save_config(config)
+
+def update_user_profile(source: str, user_id: str, speaker: Optional[str] = None, effect: Optional[str] = None, name: Optional[str] = None) -> dict:
+    profile = get_user_profile(source, user_id)
+    if speaker:
+        profile["speaker"] = speaker
+    if effect:
+        profile["effect"] = effect
+    if name:
+        profile["name"] = name.strip()[:32]
+    profile["last_active"] = time.time()
+    save_users_data(users_db)
+    return profile
+
+
+# --- ЖИВАЯ ИСТОРИЯ ОЗВУЧКИ (ACTIVITY FEED) ---
+recent_history = []
+
+
+def record_history(sender_name: str, text: str, speaker: str, effect: str):
+    item = {
+        "time": time.strftime("%H:%M:%S"),
+        "sender": sender_name or "Участник",
+        "text": text,
+        "speaker": speaker,
+        "effect": effect
+    }
+    recent_history.append(item)
+    if len(recent_history) > 30:
+        recent_history.pop(0)
 
 
 # --- ЗАГРУЗКА И ИНИЦИАЛИЗАЦИЯ SILERO TTS ---
@@ -459,32 +492,23 @@ def play_to_discord_bot(audio_data: np.ndarray):
         logger.error(f"[Discord Voice] Сбой при воспроизведении: {e}")
 
 
-def play_to_device(audio_data: np.ndarray, dev_id: int, samplerate: int):
-    if dev_id is None:
-        return
-    try:
-        channels = 1 if len(audio_data.shape) == 1 else audio_data.shape[1]
-        with sd.OutputStream(device=dev_id, samplerate=samplerate, channels=channels, dtype=np.float32) as stream:
-            stream.write(audio_data)
-    except Exception as e:
-        logger.error(f"Ошибка воспроизведения на устройстве {dev_id}: {e}")
-
-
 def worker_loop():
     logger.info("Фоновый воркер очереди озвучки запущен.")
     while True:
         task = tts_queue.get()
         if task is None:
             break
-        text, spk, volume, eff, precomputed_audio = task
+        text, spk, volume, eff, precomputed_audio, sender_name = task
         try:
             if precomputed_audio is not None:
                 status_state["status"] = "speaking"
                 status_state["current_text"] = text or "[Аудиофайл]"
+                status_state["current_sender"] = sender_name or ""
                 audio_np = precomputed_audio
             else:
                 status_state["status"] = "generating"
                 status_state["current_text"] = text
+                status_state["current_sender"] = sender_name or ""
                 status_state["speaker"] = spk
                 status_state["queue_len"] = tts_queue.qsize()
 
@@ -512,33 +536,17 @@ def worker_loop():
 
             status_state["status"] = "speaking"
 
-            threads = []
-            cable_id = config.get("cable_device_id")
-            if cable_id is not None and config.get("output_cable_enabled", True):
-                t1 = threading.Thread(target=play_to_device, args=(audio_np, cable_id, 48000), daemon=True)
-                threads.append(t1)
-                t1.start()
-
-            if config.get("monitor_enabled") and config.get("monitor_device_id") is not None:
-                monitor_id = config.get("monitor_device_id")
-                if monitor_id != cable_id:
-                    t2 = threading.Thread(target=play_to_device, args=(audio_np, monitor_id, 48000), daemon=True)
-                    threads.append(t2)
-                    t2.start()
-
             if config.get("output_discord_enabled", True) and is_discord_voice_connected():
-                t3 = threading.Thread(target=play_to_discord_bot, args=(audio_np,), daemon=True)
-                threads.append(t3)
-                t3.start()
-
-            for t in threads:
-                t.join()
+                play_to_discord_bot(audio_np)
+            elif not is_discord_voice_connected():
+                logger.warning("[Discord Voice] Бот не подключен к голосовому каналу, звук пропущен.")
 
         except Exception as e:
             logger.error(f"Ошибка воспроизведения: {e}")
         finally:
             status_state["status"] = "idle"
             status_state["current_text"] = ""
+            status_state["current_sender"] = ""
             status_state["queue_len"] = tts_queue.qsize()
             tts_queue.task_done()
 
@@ -618,11 +626,13 @@ def normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-def enqueue_tts(text: str, speaker: Optional[str] = None, effect: Optional[str] = None, raw_audio: Optional[np.ndarray] = None):
+def enqueue_tts(text: str, speaker: Optional[str] = None, effect: Optional[str] = None, raw_audio: Optional[np.ndarray] = None, sender_name: Optional[str] = None):
+    sender = sender_name or "Участник"
     if raw_audio is not None:
         sfx_vol = float(config.get("sfx_volume", 0.5))
-        logger.info(f"Воспроизведение аудиофайла: {text} (громкость SFX: {int(sfx_vol * 100)}%)")
-        tts_queue.put((text or "[Аудиофайл]", None, sfx_vol, None, raw_audio))
+        logger.info(f"[{sender}] Воспроизведение аудиофайла: {text} (громкость SFX: {int(sfx_vol * 100)}%)")
+        record_history(sender, text or "[Аудиофайл]", "🎵 SFX", "none")
+        tts_queue.put((text or "[Аудиофайл]", None, sfx_vol, None, raw_audio, sender))
         status_state["queue_len"] = tts_queue.qsize()
         return
 
@@ -632,11 +642,12 @@ def enqueue_tts(text: str, speaker: Optional[str] = None, effect: Optional[str] 
     cleaned = normalize_text(raw)
     if not cleaned:
         return
-    spk = speaker or config.get("speaker", "aidar")
-    eff = effect or config.get("effect", "none")
+    spk = speaker or config.get("default_speaker", "aidar")
+    eff = effect or "none"
     vol = float(config.get("volume", 1.0))
-    logger.info(f"Озвучивание: '{raw}' -> '{cleaned}' (голос: {spk}, эффект: {eff}, громкость: {int(vol * 100)}%)")
-    tts_queue.put((cleaned, spk, vol, eff, None))
+    logger.info(f"[{sender}] Озвучивание: '{raw}' -> '{cleaned}' (голос: {spk}, эффект: {eff}, громкость: {int(vol * 100)}%)")
+    record_history(sender, raw, spk, eff)
+    tts_queue.put((cleaned, spk, vol, eff, None, sender))
     status_state["queue_len"] = tts_queue.qsize()
 
 
@@ -692,39 +703,37 @@ async def start_telegram_bot_service():
             ("echo", "📢 Эхо")
         ]
 
-        def get_voice_keyboard():
+        def get_voice_keyboard(current_speaker: str = "aidar", current_effect: str = "none"):
             builder = InlineKeyboardBuilder()
             # Silero секция
             builder.row(types.InlineKeyboardButton(text="— 🗣️ Silero TTS (Эмоции/Ударения) —", callback_data="header_silero"))
             for code, name in silero_speakers:
-                prefix = "✅ " if config.get("speaker") == code else ""
+                prefix = "✅ " if current_speaker == code else ""
                 builder.button(text=f"{prefix}{name}", callback_data=f"voice_{code}")
             builder.adjust(1, 2, 2, 2)
 
             # Piper секция
             builder.row(types.InlineKeyboardButton(text="— 🎤 Piper TTS (Студийные VITS) —", callback_data="header_piper"))
             for code, name in piper_speakers:
-                prefix = "✅ " if config.get("speaker") == code else ""
+                prefix = "✅ " if current_speaker == code else ""
                 builder.button(text=f"{prefix}{name}", callback_data=f"voice_{code}")
 
             # Edge TTS секция
             builder.row(types.InlineKeyboardButton(text="— 🌐 Edge TTS (Microsoft Neural) —", callback_data="header_edge"))
             for code, name in edge_speakers:
-                prefix = "✅ " if config.get("speaker") == code else ""
+                prefix = "✅ " if current_speaker == code else ""
                 builder.button(text=f"{prefix}{name}", callback_data=f"voice_{code}")
 
-            mon_status = "🔊 Мониторинг: ВКЛ" if config.get("monitor_enabled") else "🔇 Мониторинг: ВЫКЛ"
-            eff_name = dict(available_effects).get(config.get("effect", "none"), "✨ Обычный")
+            eff_name = dict(available_effects).get(current_effect, "✨ Обычный")
             builder.row(
-                types.InlineKeyboardButton(text=mon_status, callback_data="toggle_monitor"),
-                types.InlineKeyboardButton(text=f"FX: {eff_name}", callback_data="open_effects")
+                types.InlineKeyboardButton(text=f"🎭 Эффект: {eff_name}", callback_data="open_effects")
             )
             return builder.as_markup()
 
-        def get_effect_keyboard():
+        def get_effect_keyboard(current_effect: str = "none"):
             builder = InlineKeyboardBuilder()
             for code, name in available_effects:
-                prefix = "✅ " if config.get("effect", "none") == code else ""
+                prefix = "✅ " if current_effect == code else ""
                 builder.button(text=f"{prefix}{name}", callback_data=f"effect_{code}")
             builder.adjust(2)
             builder.row(types.InlineKeyboardButton(text="⬅️ Назад к голосам", callback_data="open_voices"))
@@ -732,33 +741,41 @@ async def start_telegram_bot_service():
 
         @dp.message(Command("start"))
         async def cmd_start(msg: types.Message):
-            user_id = msg.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                await msg.answer(f"⛔ Доступ запрещен. Ваш Telegram ID: <code>{user_id}</code>\nУкажите его в панели управления на ПК.", parse_mode="HTML")
-                return
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            profile = get_user_profile("tg", user_id, default_name=name)
 
-            mon_text = "ВКЛ (слышно в наушниках)" if config.get("monitor_enabled") else "ВЫКЛ"
-            eff_name = dict(available_effects).get(config.get("effect", "none"), "✨ Обычный")
-            spk_name = all_speakers_dict.get(config.get("speaker"), config.get("speaker"))
+            spk_name = all_speakers_dict.get(profile.get("speaker", "aidar"), "aidar")
+            eff_name = dict(available_effects).get(profile.get("effect", "none"), "✨ Обычный")
+
+            import urllib.parse
+            host = (config.get("server_public_url") or "").strip()
+            if not host:
+                host = f"http://{get_local_ip()}:8000"
+            clean_host = host.rstrip("/")
+            safe_name = urllib.parse.quote(name)
+            personal_link = f"{clean_host}/?uid=tg_{user_id}&name={safe_name}&spk={profile.get('speaker', 'aidar')}&eff={profile.get('effect', 'none')}"
+
             text = (
-                f"🎙️ <b>TTS Discord Bridge (Silero + Piper + Edge)</b>\n\n"
-                f"Бот подключен и готов озвучивать текст и играть звуки в Discord!\n\n"
-                f"👤 Ваш Telegram ID: <code>{user_id}</code>\n"
-                f"🗣️ Текущий голос: <b>{spk_name}</b>\n"
-                f"🎭 Эффект: <b>{eff_name}</b>\n"
-                f"🎧 Мониторинг: <b>{mon_text}</b>\n\n"
+                f"🎙️ <b>TTS Discord Bridge</b>\n\n"
+                f"👋 Привет, <b>{name}</b>!\n"
+                f"У каждого участника <b>свой личный голос и эффект</b> — твои настройки индивидуальны и не сбивают других!\n\n"
+                f"🗣️ Твой голос: <b>{spk_name}</b>\n"
+                f"🎭 Твой эффект: <b>{eff_name}</b>\n\n"
                 f"💬 <b>Возможности:</b>\n"
-                f"• Текст в чат ➡️ озвучка в микрофон Discord\n"
-                f"• Аудиофайл или голосовое ➡️ воспроизведение в Discord\n"
-                f"• /voice — выбор голоса (Silero / Piper / Edge TTS)\n"
-                f"• /effect — звуковые эффекты (рация, демон, робот, эхо...)\n"
-                f"• /monitor — переключение звука в наушниках\n"
-                f"• /help — <b>шпаргалка по Silero, Piper, Edge TTS и тегам</b>\n"
-                f"• /status — статус очереди и параметров\n"
-                f"• /discord — управление ботом в голосовом канале Discord"
+                f"• Текст в чат ➡️ звучит твоим голосом в Discord\n"
+                f"• Аудиофайл или голосовое ➡️ играет в канале Discord\n"
+                f"• /voice — сменить свой персональный голос\n"
+                f"• /effect — сменить свой звуковой эффект\n"
+                f"• /help — шпаргалка по эмоциям и ударениям (+)\n"
+                f"• /discord — статус подключения к голосовому каналу"
             )
-            await msg.answer(text, parse_mode="HTML", reply_markup=get_voice_keyboard())
+            kb = types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="🌐 Открыть персональный веб-пульт", url=personal_link)],
+                [types.InlineKeyboardButton(text="🗣️ Выбрать голос", callback_data="open_voices"),
+                 types.InlineKeyboardButton(text="🎭 Выбрать эффект", callback_data="open_effects")]
+            ])
+            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
 
         @dp.message(Command("help"))
         async def cmd_help(msg: types.Message):
@@ -781,7 +798,7 @@ async def start_telegram_bot_service():
                 f"  • Работает через облако Microsoft Edge (без задержек и без лимитов)\n"
                 f"  • Идеально читает длинные предложения и сложные тексты\n\n"
                 f"🎵 <b>4. Проигрывание аудиофайлов и музыки:</b>\n"
-                f"  • Перешлите в этот бот любой аудиофайл (mp3, wav, ogg, flac) или голосовое сообщение — оно мгновенно прозвучит в Discord с громкостью SFX (50%)!\n\n"
+                f"  • Перешлите в этот бот любой аудиофайл (mp3, wav, ogg, flac) или голосовое сообщение — оно мгновенно прозвучит в Discord с громкостью SFX!\n\n"
                 f"⚡ <b>5. Быстрые теги в сообщении:</b>\n"
                 f"  • <code>[radio] Прием, как слышно?</code>\n"
                 f"  • <code>[demon] Я уничтожу вас!</code>\n"
@@ -790,127 +807,102 @@ async def start_telegram_bot_service():
             )
             await msg.answer(text, parse_mode="HTML")
 
-        @dp.message(Command("monitor"))
-        async def cmd_monitor(msg: types.Message):
-            user_id = msg.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                return
-            config["monitor_enabled"] = not config.get("monitor_enabled", False)
-            save_config(config)
-            st = "🔊 ВКЛЮЧЕН (слышно в наушниках)" if config["monitor_enabled"] else "🔇 ВЫКЛЮЧЕН"
-            await msg.answer(f"🎧 <b>Мониторинг звука:</b> {st}", parse_mode="HTML", reply_markup=get_voice_keyboard())
-
-        @dp.callback_query(F.data == "toggle_monitor")
-        async def on_toggle_monitor(callback: types.CallbackQuery):
-            user_id = callback.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                await callback.answer("Нет доступа", show_alert=True)
-                return
-            config["monitor_enabled"] = not config.get("monitor_enabled", False)
-            save_config(config)
-            await callback.message.edit_reply_markup(reply_markup=get_voice_keyboard())
-            st = "ВКЛЮЧЕН" if config["monitor_enabled"] else "ВЫКЛЮЧЕН"
-            await callback.answer(f"Мониторинг {st}")
-
         @dp.callback_query(F.data.startswith("header_"))
         async def on_header_clicked(callback: types.CallbackQuery):
             await callback.answer()
 
         @dp.message(Command("voice"))
         async def cmd_voice(msg: types.Message):
-            user_id = msg.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                return
-            await msg.answer("🗣️ Выберите голос для озвучки в Discord:", reply_markup=get_voice_keyboard())
+            user_id = str(msg.from_user.id)
+            profile = get_user_profile("tg", user_id, default_name=msg.from_user.full_name)
+            await msg.answer(
+                "🗣️ <b>Выберите ваш персональный голос для Discord:</b>",
+                parse_mode="HTML",
+                reply_markup=get_voice_keyboard(current_speaker=profile.get("speaker", "aidar"), current_effect=profile.get("effect", "none"))
+            )
 
         @dp.callback_query(F.data == "open_voices")
         async def on_open_voices(callback: types.CallbackQuery):
-            await callback.message.edit_text("🗣️ Выберите голос для озвучки:", reply_markup=get_voice_keyboard())
+            user_id = str(callback.from_user.id)
+            profile = get_user_profile("tg", user_id)
+            await callback.message.edit_text(
+                "🗣️ <b>Выберите ваш персональный голос для Discord:</b>",
+                parse_mode="HTML",
+                reply_markup=get_voice_keyboard(current_speaker=profile.get("speaker", "aidar"), current_effect=profile.get("effect", "none"))
+            )
 
         @dp.callback_query(F.data.startswith("voice_"))
         async def on_voice_selected(callback: types.CallbackQuery):
-            user_id = callback.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                await callback.answer("Нет доступа", show_alert=True)
-                return
-
             selected = callback.data.split("_")[1]
-            config["speaker"] = selected
-            save_config(config)
+            user_id = str(callback.from_user.id)
+            profile = update_user_profile("tg", user_id, speaker=selected)
             spk_name = all_speakers_dict.get(selected, selected)
-            await callback.message.edit_text(
-                f"✅ Голос изменен на: <b>{spk_name}</b>",
-                parse_mode="HTML",
-                reply_markup=get_voice_keyboard()
+            await callback.message.edit_reply_markup(
+                reply_markup=get_voice_keyboard(current_speaker=selected, current_effect=profile.get("effect", "none"))
             )
-            await callback.answer(f"Выбран: {selected}")
+            await callback.answer(f"Выбран ваш голос: {spk_name}")
 
         @dp.message(Command("effect"), Command("fx"))
         async def cmd_effect(msg: types.Message):
-            user_id = msg.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                return
-            await msg.answer("🎭 Выберите звуковой пресет / эффект:", reply_markup=get_effect_keyboard())
+            user_id = str(msg.from_user.id)
+            profile = get_user_profile("tg", user_id, default_name=msg.from_user.full_name)
+            await msg.answer(
+                "🎭 <b>Выберите ваш персональный звуковой эффект:</b>",
+                parse_mode="HTML",
+                reply_markup=get_effect_keyboard(current_effect=profile.get("effect", "none"))
+            )
 
         @dp.callback_query(F.data == "open_effects")
         async def on_open_effects(callback: types.CallbackQuery):
-            await callback.message.edit_text("🎭 Выберите звуковой пресет / эффект:", reply_markup=get_effect_keyboard())
+            user_id = str(callback.from_user.id)
+            profile = get_user_profile("tg", user_id)
+            await callback.message.edit_text(
+                "🎭 <b>Выберите ваш персональный звуковой эффект:</b>",
+                parse_mode="HTML",
+                reply_markup=get_effect_keyboard(current_effect=profile.get("effect", "none"))
+            )
 
         @dp.callback_query(F.data.startswith("effect_"))
         async def on_effect_selected(callback: types.CallbackQuery):
-            user_id = callback.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                await callback.answer("Нет доступа", show_alert=True)
-                return
-
             selected = callback.data.split("_")[1]
-            config["effect"] = selected
-            save_config(config)
+            user_id = str(callback.from_user.id)
+            profile = update_user_profile("tg", user_id, effect=selected)
             eff_name = dict(available_effects).get(selected, selected)
-            await callback.message.edit_text(
-                f"✅ Эффект изменен на: <b>{eff_name}</b>",
-                parse_mode="HTML",
-                reply_markup=get_effect_keyboard()
+            await callback.message.edit_reply_markup(
+                reply_markup=get_effect_keyboard(current_effect=selected)
             )
-            await callback.answer(f"Эффект: {eff_name}")
+            await callback.answer(f"Выбран эффект: {eff_name}")
 
         @dp.message(Command("status"))
         async def cmd_status(msg: types.Message):
-            user_id = msg.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                return
+            user_id = str(msg.from_user.id)
+            profile = get_user_profile("tg", user_id, default_name=msg.from_user.full_name)
             st = status_state["status"]
             q = tts_queue.qsize()
-            eff_name = dict(available_effects).get(config.get("effect", "none"), "✨ Обычный")
-            mon_st = "ВКЛ" if config.get("monitor_enabled") else "ВЫКЛ"
-            spk_name = all_speakers_dict.get(config.get("speaker"), config.get("speaker"))
+            eff_name = dict(available_effects).get(profile.get("effect", "none"), "✨ Обычный")
+            spk_name = all_speakers_dict.get(profile.get("speaker", "aidar"), "aidar")
             tts_vol = int(config.get("volume", 1.0) * 100)
             sfx_vol = int(config.get("sfx_volume", 0.5) * 100)
+            vc = get_active_voice_client()
+            vc_status = f"🟢 Подключен ({vc.channel.name})" if vc and vc.is_connected() else "⚪ Офлайн"
             await msg.answer(
-                f"📊 <b>Статус моста:</b>\n"
-                f"• Состояние: <code>{st}</code>\n"
+                f"📊 <b>Статус системы:</b>\n"
+                f"• Состояние озвучки: <code>{st}</code>\n"
+                f"• Discord канал: <b>{vc_status}</b>\n"
+                f"• В очереди: <b>{q}</b> фраз\n\n"
+                f"👤 <b>Ваш профиль ({profile.get('name')}):</b>\n"
                 f"• Голос: <b>{spk_name}</b>\n"
                 f"• Эффект: <b>{eff_name}</b>\n"
-                f"• Мониторинг: <b>{mon_st}</b>\n"
-                f"• В очереди: <b>{q}</b> фраз\n"
                 f"• Громкость речи: <b>{tts_vol}%</b>\n"
-                f"• Громкость SFX (звуков): <b>{sfx_vol}%</b>",
+                f"• Громкость SFX: <b>{sfx_vol}%</b>",
                 parse_mode="HTML"
             )
 
         @dp.message(F.audio | F.voice | F.document)
         async def on_audio_message(msg: types.Message):
-            user_id = msg.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                return
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            get_user_profile("tg", user_id, default_name=name)
 
             file_obj = msg.audio or msg.voice or msg.document
             if not file_obj:
@@ -935,7 +927,7 @@ async def start_telegram_bot_service():
                     return
 
                 display_name = getattr(file_obj, "file_name", "Голосовое сообщение")
-                enqueue_tts(display_name, raw_audio=audio_np)
+                enqueue_tts(display_name, raw_audio=audio_np, sender_name=name)
                 sfx_vol = int(config.get("sfx_volume", 0.5) * 100)
                 await status_msg.edit_text(f"🔊 <b>Воспроизведение ({sfx_vol}%):</b> <code>{display_name}</code>", parse_mode="HTML")
                 try:
@@ -948,14 +940,13 @@ async def start_telegram_bot_service():
 
         @dp.message(F.text)
         async def on_text_message(msg: types.Message):
-            user_id = msg.from_user.id
-            configured_id = int(config.get("tg_user_id") or 0)
-            if configured_id != 0 and user_id != configured_id:
-                return
+            user_id = str(msg.from_user.id)
+            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+            profile = get_user_profile("tg", user_id, default_name=name)
 
             raw_text = msg.text.strip()
-            chosen_spk = config.get("speaker")
-            chosen_eff = config.get("effect", "none")
+            chosen_spk = profile.get("speaker", "aidar")
+            chosen_eff = profile.get("effect", "none")
             text_to_speak = raw_text
 
             if raw_text.startswith("[") and "]" in raw_text:
@@ -973,7 +964,7 @@ async def start_telegram_bot_service():
             if not text_to_speak:
                 return
 
-            enqueue_tts(text_to_speak, chosen_spk, chosen_eff)
+            enqueue_tts(text_to_speak, chosen_spk, chosen_eff, sender_name=name)
             try:
                 await msg.react([types.ReactionTypeEmoji(emoji="📢")])
             except Exception:
@@ -1213,10 +1204,10 @@ async def lifespan(app: FastAPI):
     print("\n" + "=" * 65)
     print(" 🚀 ЛОКАЛЬНЫЙ ПУЛЬТ НА КОМПЬЮТЕРЕ:  http://127.0.0.1:8000")
     print(f" 📱 ПУЛЬТ ДЛЯ ТЕЛЕФОНА (по Wi-Fi): http://{ip}:8000")
-    print(" 🎙️ ВЫВОД ЗВУКА: CABLE Input (VB-Audio Virtual Cable)")
+    print(" 🎙️ ВЫВОД ЗВУКА: Прямой поток в голосовой канал Discord (Opus/FFmpeg)")
     print(" 🤖 TELEGRAM-БОТ: @orkdownbot (https://t.me/orkdownbot) - АКТИВИРОВАН!")
     print(" 🎮 DISCORD-БОТ: Интеграция с голосовыми каналами Discord")
-    print(" ⚙️ Настройки Telegram, Discord и выбор устройств доступны в веб-интерфейсе!")
+    print(" ⚙️ Настройки Telegram и Discord доступны в веб-интерфейсе!")
     print("=" * 65 + "\n")
     tg_bot_task = asyncio.create_task(start_telegram_bot_service())
     discord_bot_task = asyncio.create_task(start_discord_bot_service())
@@ -1244,16 +1235,20 @@ class SpeakRequest(BaseModel):
     text: str
     speaker: Optional[str] = None
     effect: Optional[str] = None
-    device_id: Optional[int] = None
+    user_id: Optional[str] = None
+    user_name: Optional[str] = None
+
+
+class UserProfileUpdateRequest(BaseModel):
+    user_id: str
+    name: Optional[str] = None
+    speaker: Optional[str] = None
+    effect: Optional[str] = None
 
 
 class ConfigUpdateRequest(BaseModel):
     speaker: Optional[str] = None
     effect: Optional[str] = None
-    cable_device_id: Optional[int] = None
-    monitor_device_id: Optional[int] = None
-    monitor_enabled: Optional[bool] = None
-    output_cable_enabled: Optional[bool] = None
     output_discord_enabled: Optional[bool] = None
     volume: Optional[float] = None
     sfx_volume: Optional[float] = None
@@ -1775,6 +1770,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 <span>Silero TTS Bridge</span>
             </div>
             <div class="header-actions">
+                <div style="display:flex; align-items:center; gap:6px; background:var(--bg-input); padding:7px 12px; border-radius:var(--radius-md); border:1px solid var(--border); font-size:13px; font-weight:600; cursor:pointer;" onclick="changeMyName()" title="Кликните, чтобы изменить свое имя в эфире">
+                    <span>👤</span>
+                    <span id="userNameDisplay">Участник</span>
+                    <span style="font-size:11px; color:var(--text-muted);">✏️</span>
+                </div>
                 <button class="icon-btn" title="Настройки Discord Бота (Голосовой канал)" onclick="openModal('discordModal')">🎮</button>
                 <button class="icon-btn" title="Шпаргалка интонаций и ударений" onclick="openModal('cheatModal')">📖</button>
                 <button class="icon-btn" title="QR-код / Телефон" onclick="openModal('phoneModal')">📱</button>
@@ -1916,7 +1916,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 <div id="uploadStatus" style="font-size: 12px; color: var(--accent-green); margin-top: 6px; font-weight: 600; display: none;"></div>
             </div>
 
-            <!-- Аудио Маршрутизация -->
+            <!-- Аудио Настройки -->
             <div class="audio-section">
                 <div class="toggle-row">
                     <span style="font-weight: 500;">🎮 Вывод в голосовой канал Discord:</span>
@@ -1924,32 +1924,6 @@ HTML_PAGE = """<!DOCTYPE html>
                         <input type="checkbox" id="discordOutputToggle" onchange="updateAudioConfig()">
                         <span class="slider"></span>
                     </label>
-                </div>
-
-                <div class="toggle-row">
-                    <span style="font-weight: 500;">🎙️ Вывод в Виртуальный Кабель (микрофон Windows):</span>
-                    <label class="switch">
-                        <input type="checkbox" id="cableOutputToggle" onchange="updateAudioConfig()">
-                        <span class="slider"></span>
-                    </label>
-                </div>
-
-                <div class="audio-row" id="cableDevRow">
-                    <span class="section-label">🎙️ Устройство Virtual Cable (CABLE Input):</span>
-                    <select id="cableSelect" onchange="updateAudioConfig()"></select>
-                </div>
-
-                <div class="toggle-row">
-                    <span style="font-weight: 500;">🎧 Мониторинг в свои наушники (слышать себя):</span>
-                    <label class="switch">
-                        <input type="checkbox" id="monitorToggle" onchange="updateAudioConfig()">
-                        <span class="slider"></span>
-                    </label>
-                </div>
-
-                <div class="audio-row" id="monitorDevRow" style="display:none;">
-                    <span class="section-label">Устройство мониторинга (Твои наушники):</span>
-                    <select id="monitorSelect" onchange="updateAudioConfig()"></select>
                 </div>
 
                 <div class="audio-row">
@@ -1975,6 +1949,17 @@ HTML_PAGE = """<!DOCTYPE html>
                         <span>🔊</span>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <!-- История активности / Лента эфира -->
+        <div class="soundboard-card" style="margin-top: 0;">
+            <div class="section-label" style="display:flex; justify-content:space-between; align-items:center;">
+                <span>📜 Прямой эфир (История озвучки)</span>
+                <span style="font-size:11px; font-weight:normal; text-transform:none; color:var(--text-muted);">в реальном времени</span>
+            </div>
+            <div id="historyFeed" style="display:flex; flex-direction:column; gap:8px; max-height:220px; overflow-y:auto; margin-top:8px;">
+                <div style="font-size:12px; color:var(--text-faint); text-align:center; padding:12px;">Здесь будут отображаться фразы и треки участников эфира</div>
             </div>
         </div>
 
@@ -2187,9 +2172,74 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <script>
+        let myUserId = "";
+        let myUserName = "";
         let currentSpeaker = "aidar";
         let currentEffect = "none";
         let quickPhrases = [];
+
+        function initIdentity() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const pUid = urlParams.get('uid');
+            const pName = urlParams.get('name');
+            const pSpk = urlParams.get('spk');
+            const pEff = urlParams.get('eff');
+
+            if (pUid) {
+                myUserId = pUid.trim();
+                localStorage.setItem('voicer_uid', myUserId);
+            } else {
+                myUserId = localStorage.getItem('voicer_uid');
+                if (!myUserId) {
+                    myUserId = 'web_' + Math.random().toString(36).substring(2, 8);
+                    localStorage.setItem('voicer_uid', myUserId);
+                }
+            }
+
+            if (pName) {
+                myUserName = pName.trim();
+                localStorage.setItem('voicer_name', myUserName);
+            } else {
+                myUserName = localStorage.getItem('voicer_name') || ('Участник #' + myUserId.slice(-4));
+            }
+
+            if (pSpk) {
+                currentSpeaker = pSpk;
+                localStorage.setItem('voicer_speaker', currentSpeaker);
+            } else if (localStorage.getItem('voicer_speaker')) {
+                currentSpeaker = localStorage.getItem('voicer_speaker');
+            }
+
+            if (pEff) {
+                currentEffect = pEff;
+                localStorage.setItem('voicer_effect', currentEffect);
+            } else if (localStorage.getItem('voicer_effect')) {
+                currentEffect = localStorage.getItem('voicer_effect');
+            }
+
+            document.getElementById('userNameDisplay').innerText = myUserName;
+        }
+
+        async function changeMyName() {
+            const res = prompt('Введите ваше имя / никнейм для отображения в эфире:', myUserName);
+            if (res !== null && res.trim()) {
+                myUserName = res.trim();
+                localStorage.setItem('voicer_name', myUserName);
+                document.getElementById('userNameDisplay').innerText = myUserName;
+                try {
+                    await fetch('/api/user/profile', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            user_id: myUserId,
+                            name: myUserName,
+                            speaker: currentSpeaker,
+                            effect: currentEffect
+                        })
+                    });
+                } catch(e) {}
+            }
+        }
 
         function openModal(id) { document.getElementById(id).style.display = 'flex'; }
         function closeModal(id) { document.getElementById(id).style.display = 'none'; }
@@ -2199,25 +2249,40 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         };
 
-        // Загрузка устройств и конфига
+        // Загрузка персонального профиля и общего конфига
         async function init() {
+            initIdentity();
             try {
+                // Загружаем профиль пользователя с сервера (если есть)
+                try {
+                    const profRes = await fetch(`/api/user/profile?uid=${encodeURIComponent(myUserId)}&name=${encodeURIComponent(myUserName)}`);
+                    if (profRes.ok) {
+                        const prof = await profRes.json();
+                        if (prof.name) {
+                            myUserName = prof.name;
+                            localStorage.setItem('voicer_name', myUserName);
+                            document.getElementById('userNameDisplay').innerText = myUserName;
+                        }
+                        if (prof.speaker && !new URLSearchParams(window.location.search).get('spk')) {
+                            currentSpeaker = prof.speaker;
+                            localStorage.setItem('voicer_speaker', currentSpeaker);
+                        }
+                        if (prof.effect && !new URLSearchParams(window.location.search).get('eff')) {
+                            currentEffect = prof.effect;
+                            localStorage.setItem('voicer_effect', currentEffect);
+                        }
+                    }
+                } catch(e) {}
+
                 const res = await fetch('/api/config');
                 const data = await res.json();
                 
-                currentSpeaker = data.speaker || "aidar";
-                currentEffect = data.effect || "none";
                 quickPhrases = data.quick_phrases || [];
                 updateSpeakerButtons();
                 updateEffectButtons();
                 renderQuickPhrases();
-
-                document.getElementById('monitorToggle').checked = !!data.monitor_enabled;
-                document.getElementById('monitorDevRow').style.display = data.monitor_enabled ? 'flex' : 'none';
                 
                 document.getElementById('discordOutputToggle').checked = data.output_discord_enabled !== undefined ? !!data.output_discord_enabled : true;
-                document.getElementById('cableOutputToggle').checked = data.output_cable_enabled !== undefined ? !!data.output_cable_enabled : true;
-                document.getElementById('cableDevRow').style.display = (data.output_cable_enabled !== false) ? 'flex' : 'none';
                 
                 const vol = Math.round((data.volume || 1.0) * 100);
                 document.getElementById('volSlider').value = vol;
@@ -2230,25 +2295,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 document.getElementById('tgTokenInput').value = data.tg_token || "";
                 document.getElementById('tgUserIdInput').value = data.tg_user_id || 0;
                 document.getElementById('lanUrlBox').innerText = data.lan_url;
-
-                // Загрузка списков устройств
-                const devRes = await fetch('/api/devices');
-                const devData = await devRes.json();
-                
-                const cableSelect = document.getElementById('cableSelect');
-                const monitorSelect = document.getElementById('monitorSelect');
-                cableSelect.innerHTML = '';
-                monitorSelect.innerHTML = '';
-
-                devData.devices.forEach(d => {
-                    const opt1 = new Option(d.name, d.id);
-                    if (d.id === devData.current_cable) opt1.selected = true;
-                    cableSelect.add(opt1);
-
-                    const opt2 = new Option(d.name, d.id);
-                    if (d.id === devData.current_monitor) opt2.selected = true;
-                    monitorSelect.add(opt2);
-                });
 
             } catch (err) {
                 console.error("Ошибка инициализации:", err);
@@ -2267,12 +2313,20 @@ HTML_PAGE = """<!DOCTYPE html>
 
         async function selectSpeaker(spk) {
             currentSpeaker = spk;
+            localStorage.setItem('voicer_speaker', spk);
             updateSpeakerButtons();
-            await fetch('/api/config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({speaker: spk})
-            });
+            try {
+                await fetch('/api/user/profile', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        user_id: myUserId,
+                        name: myUserName,
+                        speaker: currentSpeaker,
+                        effect: currentEffect
+                    })
+                });
+            } catch(e) {}
         }
 
         function updateEffectButtons() {
@@ -2287,12 +2341,20 @@ HTML_PAGE = """<!DOCTYPE html>
 
         async function selectEffect(eff) {
             currentEffect = eff;
+            localStorage.setItem('voicer_effect', eff);
             updateEffectButtons();
-            await fetch('/api/config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({effect: eff})
-            });
+            try {
+                await fetch('/api/user/profile', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        user_id: myUserId,
+                        name: myUserName,
+                        speaker: currentSpeaker,
+                        effect: currentEffect
+                    })
+                });
+            } catch(e) {}
         }
 
         function onVolChange(val) {
@@ -2304,13 +2366,7 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         async function updateAudioConfig() {
-            const cable_device_id = parseInt(document.getElementById('cableSelect').value);
-            const monitor_enabled = document.getElementById('monitorToggle').checked;
-            document.getElementById('monitorDevRow').style.display = monitor_enabled ? 'flex' : 'none';
-            const monitor_device_id = parseInt(document.getElementById('monitorSelect').value);
             const output_discord_enabled = document.getElementById('discordOutputToggle').checked;
-            const output_cable_enabled = document.getElementById('cableOutputToggle').checked;
-            document.getElementById('cableDevRow').style.display = output_cable_enabled ? 'flex' : 'none';
             const volume = parseFloat(document.getElementById('volSlider').value) / 100.0;
             const sfx_volume = parseFloat(document.getElementById('sfxVolSlider').value) / 100.0;
 
@@ -2318,11 +2374,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    cable_device_id,
-                    monitor_enabled,
-                    monitor_device_id,
                     output_discord_enabled,
-                    output_cable_enabled,
                     volume,
                     sfx_volume
                 })
@@ -2346,9 +2398,12 @@ HTML_PAGE = """<!DOCTYPE html>
                     body: JSON.stringify({
                         text: text,
                         speaker: customSpeaker || currentSpeaker,
-                        effect: customEffect || currentEffect
+                        effect: customEffect || currentEffect,
+                        user_id: myUserId,
+                        user_name: myUserName
                     })
                 });
+                setTimeout(pollHistory, 300);
             } catch (e) {
                 console.error("Ошибка отправки речи:", e);
             }
@@ -2609,6 +2664,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
             const formData = new FormData();
             formData.append('file', file);
+            formData.append('user_name', myUserName);
 
             try {
                 const res = await fetch('/api/play_audio_file', {
@@ -2619,6 +2675,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (data.status === 'enqueued') {
                     status.style.color = 'var(--accent-green)';
                     status.innerText = `✅ Играет в Discord: ${data.filename}`;
+                    setTimeout(pollHistory, 500);
                 } else {
                     status.style.color = 'var(--accent-red)';
                     status.innerText = `❌ Ошибка: ${data.message || 'Сбой'}`;
@@ -2630,6 +2687,65 @@ HTML_PAGE = """<!DOCTYPE html>
             setTimeout(() => {
                 status.style.display = 'none';
             }, 5000);
+        }
+
+        // Поллинг истории активности
+        let lastHistoryStr = "";
+        async function pollHistory() {
+            try {
+                const res = await fetch('/api/history');
+                const data = await res.json();
+                const feed = document.getElementById('historyFeed');
+                const hist = data.history || [];
+                const histStr = JSON.stringify(hist);
+                if (histStr === lastHistoryStr) {
+                    setTimeout(pollHistory, 1500);
+                    return;
+                }
+                lastHistoryStr = histStr;
+
+                if (hist.length === 0) {
+                    feed.innerHTML = '<div style="font-size:12px; color:var(--text-faint); text-align:center; padding:12px;">Пока никто ничего не озвучивал. Отправьте первую фразу!</div>';
+                    setTimeout(pollHistory, 1500);
+                    return;
+                }
+
+                feed.innerHTML = '';
+                const reversed = [...hist].reverse();
+                reversed.forEach(item => {
+                    const el = document.createElement('div');
+                    el.style.cssText = 'background:var(--bg-input); padding:8px 12px; border-radius:var(--radius-sm); border:1px solid var(--border); font-size:13px; display:flex; justify-content:space-between; align-items:center; gap:8px;';
+                    
+                    const left = document.createElement('div');
+                    left.style.cssText = 'display:flex; align-items:center; gap:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+                    
+                    const isMe = item.sender === myUserName;
+                    const nameBadge = document.createElement('span');
+                    nameBadge.style.cssText = `font-weight:700; color:${isMe ? 'var(--accent-green)' : 'var(--accent)'}; flex-shrink:0;`;
+                    nameBadge.innerText = (isMe ? '👤 ' : '🗣️ ') + item.sender;
+                    
+                    const metaBadge = document.createElement('span');
+                    metaBadge.style.cssText = 'font-size:11px; color:var(--text-muted); background:var(--bg-card); padding:2px 6px; border-radius:4px; border:1px solid var(--border); flex-shrink:0;';
+                    metaBadge.innerText = `${item.speaker}${item.effect && item.effect !== 'none' ? ' • ' + item.effect : ''}`;
+
+                    const txtSpan = document.createElement('span');
+                    txtSpan.style.cssText = 'color:var(--text-main); font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+                    txtSpan.innerText = `"${item.text}"`;
+
+                    left.appendChild(nameBadge);
+                    left.appendChild(metaBadge);
+                    left.appendChild(txtSpan);
+
+                    const right = document.createElement('span');
+                    right.style.cssText = 'font-size:11px; color:var(--text-faint); white-space:nowrap; margin-left:6px; flex-shrink:0;';
+                    right.innerText = item.time || '';
+
+                    el.appendChild(left);
+                    el.appendChild(right);
+                    feed.appendChild(el);
+                });
+            } catch (e) {}
+            setTimeout(pollHistory, 1500);
         }
 
         // Поллинг статуса
@@ -2661,6 +2777,7 @@ HTML_PAGE = """<!DOCTYPE html>
         init();
         pollStatus();
         pollDiscordStatus();
+        pollHistory();
     </script>
 </body>
 </html>
@@ -2687,35 +2804,12 @@ async def get_status():
     }
 
 
-@app.get("/api/devices")
-async def get_devices():
-    devices = []
-    try:
-        for idx, d in enumerate(sd.query_devices()):
-            if d.get("max_output_channels", 0) > 0:
-                devices.append({
-                    "id": idx,
-                    "name": f"[{idx}] {d['name']} ({d.get('hostapi', '')})"
-                })
-    except Exception as e:
-        logger.debug(f"Не удалось получить список звуковых устройств: {e}")
-    return {
-        "devices": devices,
-        "current_cable": config.get("cable_device_id"),
-        "current_monitor": config.get("monitor_device_id")
-    }
-
-
 @app.get("/api/config")
 async def get_config():
     ip = get_local_ip()
     return {
         "speaker": config.get("speaker", "aidar"),
         "effect": config.get("effect", "none"),
-        "cable_device_id": config.get("cable_device_id"),
-        "monitor_device_id": config.get("monitor_device_id"),
-        "monitor_enabled": config.get("monitor_enabled", True),
-        "output_cable_enabled": config.get("output_cable_enabled", True),
         "output_discord_enabled": config.get("output_discord_enabled", True),
         "volume": config.get("volume", 1.0),
         "sfx_volume": config.get("sfx_volume", 0.5),
@@ -2726,13 +2820,38 @@ async def get_config():
     }
 
 
+@app.get("/api/user/profile")
+async def api_get_user_profile(uid: str, name: Optional[str] = None):
+    profile = get_user_profile(uid, default_name=name)
+    return profile
+
+
+@app.post("/api/user/profile")
+async def api_update_user_profile(req: UserProfileUpdateRequest):
+    updates = {}
+    if req.name is not None and req.name.strip():
+        updates["name"] = req.name.strip()
+    if req.speaker is not None:
+        updates["speaker"] = req.speaker
+    if req.effect is not None:
+        updates["effect"] = req.effect
+    profile = update_user_profile(req.user_id, updates, default_name=req.name)
+    return profile
+
+
+@app.get("/api/history")
+async def api_get_history():
+    return {"history": list(recent_history)}
+
+
 @app.post("/api/speak")
 async def api_speak(req: SpeakRequest):
     spk = req.speaker or config.get("speaker", "aidar")
     eff = req.effect or config.get("effect", "none")
-    if req.device_id is not None:
-        config["cable_device_id"] = req.device_id
-    enqueue_tts(req.text, spk, eff)
+    uname = (req.user_name or "Веб-участник").strip()
+    if req.user_id:
+        update_user_profile(req.user_id, {"speaker": spk, "effect": eff, "name": uname}, default_name=uname)
+    enqueue_tts(req.text, spk, eff, sender_name=uname)
     return {"status": "enqueued", "queue_size": tts_queue.qsize()}
 
 
@@ -2742,14 +2861,6 @@ async def update_config(req: ConfigUpdateRequest):
         config["speaker"] = req.speaker
     if req.effect is not None:
         config["effect"] = req.effect
-    if req.cable_device_id is not None:
-        config["cable_device_id"] = req.cable_device_id
-    if req.monitor_device_id is not None:
-        config["monitor_device_id"] = req.monitor_device_id
-    if req.monitor_enabled is not None:
-        config["monitor_enabled"] = req.monitor_enabled
-    if req.output_cable_enabled is not None:
-        config["output_cable_enabled"] = req.output_cable_enabled
     if req.output_discord_enabled is not None:
         config["output_discord_enabled"] = req.output_discord_enabled
     if req.volume is not None:
@@ -2798,8 +2909,7 @@ async def get_discord_info():
         "current_channel_id": current_channel_id,
         "current_channel_name": current_channel_name,
         "guilds": guilds_data,
-        "output_discord_enabled": config.get("output_discord_enabled", True),
-        "output_cable_enabled": config.get("output_cable_enabled", True)
+        "output_discord_enabled": config.get("output_discord_enabled", True)
     }
 
 
@@ -2867,14 +2977,15 @@ async def discord_leave_channel():
 
 
 @app.post("/api/play_audio_file")
-async def api_play_audio_file(file: UploadFile = File(...)):
+async def api_play_audio_file(file: UploadFile = File(...), user_name: Optional[str] = Form(None)):
     try:
         content = await file.read()
         audio_data = decode_audio_bytes(content)
         if len(audio_data) == 0:
             return {"status": "error", "message": "Пустой или неподдерживаемый аудиофайл"}
         display_name = file.filename or "Аудиофайл"
-        enqueue_tts(display_name, raw_audio=audio_data)
+        sender = (user_name or "Веб-участник").strip()
+        enqueue_tts(display_name, raw_audio=audio_data, sender_name=sender)
         return {
             "status": "enqueued",
             "filename": display_name,
