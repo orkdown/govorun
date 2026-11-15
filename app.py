@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+import html
 import json
 import logging
 import os
@@ -792,6 +793,29 @@ def get_effect_keyboard(current_effect: str = "none", current_speaker: str = "ai
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def get_main_reply_keyboard():
+    if not types:
+        return None
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                types.KeyboardButton(text="🗣️ Выбрать голос"),
+                types.KeyboardButton(text="🎭 Звуковой эффект")
+            ],
+            [
+                types.KeyboardButton(text="🎮 Discord"),
+                types.KeyboardButton(text="📊 Статус")
+            ],
+            [
+                types.KeyboardButton(text="📖 Шпаргалка"),
+                types.KeyboardButton(text="🌐 Веб-пульт")
+            ]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
 def build_discord_keyboard_and_text(user_id: str = "0", name: str = "Пользователь"):
     token = config.get("discord_token", "").strip()
     online = discord_bot_instance is not None and discord_bot_instance.is_ready()
@@ -802,11 +826,15 @@ def build_discord_keyboard_and_text(user_id: str = "0", name: str = "Польз�
 
     guild_name = vc.channel.guild.name if (in_voice and vc and vc.channel and vc.channel.guild) else ""
     ch_name = vc.channel.name if (in_voice and vc and vc.channel) else ""
-    ch_str = f"🔊 <b>{ch_name}</b> (сервер <b>{guild_name}</b>)" if in_voice else "<i>Не подключен к каналу</i>"
+    
+    safe_bot_name = html.escape(bot_name)
+    safe_guild_name = html.escape(guild_name)
+    safe_ch_name = html.escape(ch_name)
+    ch_str = f"🔊 <b>{safe_ch_name}</b> (сервер <b>{safe_guild_name}</b>)" if in_voice else "<i>Не подключен к каналу</i>"
 
     text = (
         f"🎮 <b>Управление Discord Ботом:</b>\n\n"
-        f"• Бот: <b>{bot_name}</b>\n"
+        f"• Бот: <b>{safe_bot_name}</b>\n"
         f"• Статус: {st_icon} <b>{'В голосовом канале' if in_voice else ('В сети' if online else 'Офлайн')}</b>\n"
         f"• Голосовой канал: {ch_str}\n\n"
     )
@@ -814,12 +842,15 @@ def build_discord_keyboard_and_text(user_id: str = "0", name: str = "Польз�
     rows = []
     if online:
         channels_buttons = []
-        for g in discord_bot_instance.guilds:
-            for ch in g.voice_channels:
-                is_current = in_voice and vc and vc.channel and vc.channel.id == ch.id
-                prefix = "✅ " if is_current else "📞 "
-                label = f"{prefix}{ch.name[:16]}"
-                channels_buttons.append(types.InlineKeyboardButton(text=label, callback_data=f"djoin_{ch.id}"))
+        try:
+            for g in discord_bot_instance.guilds:
+                for ch in g.voice_channels:
+                    is_current = in_voice and vc and vc.channel and vc.channel.id == ch.id
+                    prefix = "✅ " if is_current else "📞 "
+                    label = f"{prefix}{ch.name[:16]}"
+                    channels_buttons.append(types.InlineKeyboardButton(text=label, callback_data=f"djoin_{ch.id}"))
+        except Exception as e_ch:
+            logger.warning(f"[Telegram] Ошибка при считывании каналов Discord: {e_ch}")
         
         for i in range(0, len(channels_buttons), 2):
             rows.append(channels_buttons[i:i+2])
@@ -827,12 +858,15 @@ def build_discord_keyboard_and_text(user_id: str = "0", name: str = "Польз�
         if in_voice:
             rows.append([types.InlineKeyboardButton(text="🚪 Отключить бота от канала", callback_data="dleave")])
         
-        text += "💡 <i>Нажмите на голосовой канал ниже, чтобы бот зашел в него:</i>"
+        if channels_buttons:
+            text += "💡 <i>Нажмите на голосовой канал ниже, чтобы бот зашел в него:</i>"
+        else:
+            text += "⚠️ <i>Бот в сети, но не видит голосовых каналов. Проверьте, добавлен ли бот на ваш сервер Discord.</i>"
     else:
         if not token:
             text += "❌ <b>Токен Discord-бота не указан!</b>\nУкажите токен в настройках веб-панели (иконка 🎮 в шапке сайта)."
         else:
-            text += "⏳ <b>Discord-бот подключается к сети...</b>\nПожалуйста, подождите несколько секунд и обновите статус кнопкой ниже."
+            text += "⏳ <b>Discord-бот не в сети или подключается...</b>\nЕсли бот не подключился через минуту, проверьте правильность токена и логи сервера."
 
     rows.append([
         types.InlineKeyboardButton(text="🔄 Обновить статус Discord", callback_data="drefresh")
@@ -860,16 +894,17 @@ def build_status_keyboard_and_text(user_id: str, name: str):
     tts_vol = int(config.get("volume", 1.0) * 100)
     sfx_vol = int(config.get("sfx_volume", 0.5) * 100)
     vc = get_active_voice_client()
-    vc_status = f"🟢 В канале ({vc.channel.name})" if (vc and vc.is_connected() and vc.channel) else "⚪ Не в канале"
+    vc_ch_name = html.escape(vc.channel.name) if (vc and vc.is_connected() and vc.channel) else ""
+    vc_status = f"🟢 В канале ({vc_ch_name})" if vc_ch_name else "⚪ Не в канале"
     
     text = (
         f"📊 <b>Статус системы:</b>\n"
         f"• Состояние озвучки: <code>{st}</code>\n"
         f"• Discord: <b>{vc_status}</b>\n"
         f"• В очереди: <b>{q}</b> фраз\n\n"
-        f"👤 <b>Ваш профиль ({profile.get('name', name)}):</b>\n"
-        f"• Голос: <b>{spk_name}</b>\n"
-        f"• Эффект: <b>{eff_name}</b>\n"
+        f"👤 <b>Ваш профиль ({html.escape(profile.get('name', name))}):</b>\n"
+        f"• Голос: <b>{html.escape(spk_name)}</b>\n"
+        f"• Эффект: <b>{html.escape(eff_name)}</b>\n"
         f"• Громкость речи: <b>{tts_vol}%</b>\n"
         f"• Громкость SFX: <b>{sfx_vol}%</b>"
     )
@@ -942,77 +977,164 @@ async def start_telegram_bot_service():
         tg_bot_instance = bot
         tg_dispatcher_instance = dp
 
-        @dp.message(Command("start"))
+        MENU_REPLY_TRIGGERS = [
+            "🗣️ выбрать голос", "🗣️ голос", "голос",
+            "🎭 звуковой эффект", "🎭 эффект", "эффект", "звуковой эффект",
+            "🎮 discord", "discord", "дискорд", "дс",
+            "📊 статус", "статус",
+            "📖 шпаргалка", "шпаргалка", "помощь", "хелп",
+            "🌐 веб-пульт", "🌐 личный веб-пульт", "веб-пульт", "пульт",
+            "старт", "меню", "главное меню"
+        ]
+
+        @dp.message(Command("start"), Command("menu"))
+        @dp.message(F.text.casefold().in_(["старт", "/start", "меню", "/menu", "главное меню"]))
         async def cmd_start(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
-            profile = get_user_profile("tg", user_id, default_name=name)
+            try:
+                user_id = str(msg.from_user.id)
+                name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+                profile = get_user_profile("tg", user_id, default_name=name)
 
-            spk_name = all_speakers_dict.get(profile.get("speaker", "aidar"), "aidar")
-            eff_name = dict(available_effects).get(profile.get("effect", "none"), "✨ Обычный")
-            personal_link = get_personal_link(user_id, name, profile.get("speaker", "aidar"), profile.get("effect", "none"))
+                spk_name = all_speakers_dict.get(profile.get("speaker", "aidar"), "aidar")
+                eff_name = dict(available_effects).get(profile.get("effect", "none"), "✨ Обычный")
+                personal_link = get_personal_link(user_id, name, profile.get("speaker", "aidar"), profile.get("effect", "none"))
 
-            text = (
-                f"🎙️ <b>TTS Discord Bridge</b>\n\n"
-                f"👋 Привет, <b>{name}</b>!\n"
-                f"У каждого участника <b>свой личный голос и эффект</b> — твои настройки индивидуальны и не сбивают других!\n\n"
-                f"🗣️ Твой голос: <b>{spk_name}</b>\n"
-                f"🎭 Твой эффект: <b>{eff_name}</b>\n\n"
-                f"💬 <b>Возможности:</b>\n"
-                f"• Текст в чат ➡️ звучит твоим голосом в Discord\n"
-                f"• Аудиофайл или голосовое ➡️ играет в канале Discord\n"
-                f"• /voice — сменить свой персональный голос\n"
-                f"• /effect — сменить свой звуковой эффект\n"
-                f"• /discord — подключить бота к каналу Discord\n"
-                f"• /status — статус очереди и Discord-бота\n"
-                f"• /help — шпаргалка по эмоциям и ударениям (+)"
-            )
-            kb = types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="🌐 Открыть персональный веб-пульт", url=personal_link)],
-                [types.InlineKeyboardButton(text="🗣️ Выбрать голос", callback_data="open_voices"),
-                 types.InlineKeyboardButton(text="🎭 Выбрать эффект", callback_data="open_effects")],
-                [types.InlineKeyboardButton(text="🎮 Discord Каналы", callback_data="open_discord"),
-                 types.InlineKeyboardButton(text="📊 Статус", callback_data="open_status")],
-                [types.InlineKeyboardButton(text="📖 Шпаргалка по ударениям (+)", callback_data="open_help")]
-            ])
-            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+                text = (
+                    f"🎙️ <b>TTS Discord Bridge</b>\n\n"
+                    f"👋 Привет, <b>{html.escape(name)}</b>!\n"
+                    f"У каждого участника <b>свой личный голос и эффект</b> — твои настройки индивидуальны и не сбивают других!\n\n"
+                    f"🗣️ Твой голос: <b>{html.escape(spk_name)}</b>\n"
+                    f"🎭 Твой эффект: <b>{html.escape(eff_name)}</b>\n\n"
+                    f"💬 <b>Возможности:</b>\n"
+                    f"• Текст в чат ➡️ звучит твоим голосом в Discord\n"
+                    f"• Аудиофайл или голосовое ➡️ играет в канале Discord\n"
+                    f"• Кнопки внизу экрана ⬇️ для быстрого управления\n"
+                    f"• /voice — сменить персональный голос\n"
+                    f"• /effect — сменить звуковой эффект\n"
+                    f"• /discord — управление каналом Discord\n"
+                    f"• /status — статус очереди и бота\n"
+                    f"• /help — шпаргалка по эмоциям и ударениям (+)"
+                )
+                kb = types.InlineKeyboardMarkup(inline_keyboard=[
+                    [types.InlineKeyboardButton(text="🌐 Открыть персональный веб-пульт", url=personal_link)],
+                    [types.InlineKeyboardButton(text="🗣️ Выбрать голос", callback_data="open_voices"),
+                     types.InlineKeyboardButton(text="🎭 Выбрать эффект", callback_data="open_effects")],
+                    [types.InlineKeyboardButton(text="🎮 Discord Каналы", callback_data="open_discord"),
+                     types.InlineKeyboardButton(text="📊 Статус", callback_data="open_status")],
+                    [types.InlineKeyboardButton(text="📖 Шпаргалка по ударениям (+)", callback_data="open_help")]
+                ])
+                # Dock reply keyboard at the bottom, then send menu card
+                await msg.answer("⌨️ Главное меню закреплено внизу экрана ⬇️", reply_markup=get_main_reply_keyboard())
+                try:
+                    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+                except Exception:
+                    import re
+                    plain_text = re.sub(r"<[^>]+>", "", text)
+                    await msg.answer(plain_text, parse_mode=None, reply_markup=kb)
+            except Exception as e:
+                logger.error(f"[Telegram] Ошибка cmd_start: {e}", exc_info=True)
+                await msg.answer(f"⚠️ Ошибка: {e}", reply_markup=get_main_reply_keyboard())
 
         @dp.message(Command("help"))
+        @dp.message(F.text.casefold().in_(["📖 шпаргалка", "шпаргалка", "помощь", "хелп", "/help"]))
         async def cmd_help(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
-            text, kb = build_help_keyboard_and_text(user_id, name)
-            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+            try:
+                user_id = str(msg.from_user.id)
+                name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+                text, kb = build_help_keyboard_and_text(user_id, name)
+                try:
+                    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+                except Exception:
+                    import re
+                    plain_text = re.sub(r"<[^>]+>", "", text)
+                    await msg.answer(plain_text, parse_mode=None, reply_markup=kb)
+            except Exception as e:
+                logger.error(f"[Telegram] Ошибка cmd_help: {e}", exc_info=True)
+                await msg.answer(f"⚠️ Ошибка: {e}")
 
         @dp.message(Command("voice"))
+        @dp.message(F.text.casefold().in_(["🗣️ выбрать голос", "🗣️ голос", "голос", "/voice"]))
         async def cmd_voice(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
-            profile = get_user_profile("tg", user_id, default_name=name)
-            kb = get_voice_keyboard(current_speaker=profile.get("speaker", "aidar"), current_effect=profile.get("effect", "none"), user_id=user_id, name=name)
-            await msg.answer("🗣️ <b>Выберите ваш персональный голос для Discord:</b>", parse_mode="HTML", reply_markup=kb)
+            try:
+                user_id = str(msg.from_user.id)
+                name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+                profile = get_user_profile("tg", user_id, default_name=name)
+                kb = get_voice_keyboard(current_speaker=profile.get("speaker", "aidar"), current_effect=profile.get("effect", "none"), user_id=user_id, name=name)
+                await msg.answer("🗣️ <b>Выберите ваш персональный голос для Discord:</b>", parse_mode="HTML", reply_markup=kb)
+            except Exception as e:
+                logger.error(f"[Telegram] Ошибка cmd_voice: {e}", exc_info=True)
+                await msg.answer(f"⚠️ Ошибка: {e}")
 
         @dp.message(Command("effect"), Command("fx"))
+        @dp.message(F.text.casefold().in_(["🎭 звуковой эффект", "🎭 эффект", "эффект", "звуковой эффект", "/effect", "/fx"]))
         async def cmd_effect(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
-            profile = get_user_profile("tg", user_id, default_name=name)
-            kb = get_effect_keyboard(current_effect=profile.get("effect", "none"), current_speaker=profile.get("speaker", "aidar"), user_id=user_id, name=name)
-            await msg.answer("🎭 <b>Выберите ваш персональный звуковой эффект:</b>", parse_mode="HTML", reply_markup=kb)
+            try:
+                user_id = str(msg.from_user.id)
+                name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+                profile = get_user_profile("tg", user_id, default_name=name)
+                kb = get_effect_keyboard(current_effect=profile.get("effect", "none"), current_speaker=profile.get("speaker", "aidar"), user_id=user_id, name=name)
+                await msg.answer("🎭 <b>Выберите ваш персональный звуковой эффект:</b>", parse_mode="HTML", reply_markup=kb)
+            except Exception as e:
+                logger.error(f"[Telegram] Ошибка cmd_effect: {e}", exc_info=True)
+                await msg.answer(f"⚠️ Ошибка: {e}")
 
         @dp.message(Command("status"))
+        @dp.message(F.text.casefold().in_(["📊 статус", "статус", "/status"]))
         async def cmd_status(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
-            text, kb = build_status_keyboard_and_text(user_id, name)
-            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+            try:
+                user_id = str(msg.from_user.id)
+                name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+                text, kb = build_status_keyboard_and_text(user_id, name)
+                try:
+                    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+                except Exception:
+                    import re
+                    plain_text = re.sub(r"<[^>]+>", "", text)
+                    await msg.answer(plain_text, parse_mode=None, reply_markup=kb)
+            except Exception as e:
+                logger.error(f"[Telegram] Ошибка cmd_status: {e}", exc_info=True)
+                await msg.answer(f"⚠️ Ошибка: {e}")
 
-        @dp.message(Command("discord"))
+        @dp.message(Command("discord"), Command("dc"))
+        @dp.message(F.text.casefold().in_(["🎮 discord", "discord", "дискорд", "дс", "/discord", "/dc"]))
         async def cmd_discord(msg: types.Message):
-            user_id = str(msg.from_user.id)
-            name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
-            text, kb = build_discord_keyboard_and_text(user_id, name)
-            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+            try:
+                user_id = str(msg.from_user.id)
+                name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+                text, kb = build_discord_keyboard_and_text(user_id, name)
+                try:
+                    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+                except Exception as e_html:
+                    logger.warning(f"[Telegram] Ошибка HTML-парсинга в /discord: {e_html}")
+                    import re
+                    plain_text = re.sub(r"<[^>]+>", "", text)
+                    await msg.answer(plain_text, parse_mode=None, reply_markup=kb)
+            except Exception as e:
+                logger.error(f"[Telegram] Исключение в cmd_discord: {e}", exc_info=True)
+                await msg.answer(f"⚠️ Ошибка вызова Discord-панели: {e}", reply_markup=get_main_reply_keyboard())
+
+        @dp.message(F.text.casefold().in_(["🌐 веб-пульт", "🌐 личный веб-пульт", "веб-пульт", "пульт"]))
+        async def cmd_web_panel(msg: types.Message):
+            try:
+                user_id = str(msg.from_user.id)
+                name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
+                profile = get_user_profile("tg", user_id, default_name=name)
+                link = get_personal_link(user_id, name, profile.get("speaker", "aidar"), profile.get("effect", "none"))
+                kb = types.InlineKeyboardMarkup(inline_keyboard=[
+                    [types.InlineKeyboardButton(text="🌐 Открыть личный веб-пульт", url=link)]
+                ])
+                await msg.answer(
+                    f"🌐 <b>Ваш персональный веб-пульт:</b>\n\n"
+                    f"👤 Пользователь: <b>{html.escape(name)}</b>\n"
+                    f"🗣️ Голос: <b>{html.escape(profile.get('speaker', 'aidar'))}</b>\n"
+                    f"🎭 Эффект: <b>{html.escape(profile.get('effect', 'none'))}</b>\n\n"
+                    f"Нажмите кнопку ниже, чтобы открыть панель в браузере:",
+                    parse_mode="HTML",
+                    reply_markup=kb
+                )
+            except Exception as e:
+                logger.error(f"[Telegram] Ошибка cmd_web_panel: {e}", exc_info=True)
+                await msg.answer(f"⚠️ Ошибка: {e}")
 
         @dp.message(Command("dleave"))
         async def cmd_dleave(msg: types.Message):
@@ -1229,7 +1351,7 @@ async def start_telegram_bot_service():
                 logger.error(f"[Telegram] Ошибка воспроизведения файла: {e}")
                 await msg.reply(f"❌ Ошибка воспроизведения: {e}")
 
-        @dp.message(F.text & ~F.text.startswith("/"))
+        @dp.message(F.text & ~F.text.startswith("/") & ~F.text.casefold().in_(MENU_REPLY_TRIGGERS))
         async def on_text_message(msg: types.Message):
             user_id = str(msg.from_user.id)
             name = msg.from_user.full_name or msg.from_user.username or f"User_{user_id}"
@@ -1299,9 +1421,12 @@ async def start_discord_bot_service():
 
     try:
         intents = discord.Intents.default()
-        intents.message_content = True
         intents.guilds = True
         intents.voice_states = True
+        try:
+            intents.message_content = False
+        except Exception:
+            pass
 
         bot = commands.Bot(command_prefix="!", intents=intents)
         discord_bot_instance = bot
